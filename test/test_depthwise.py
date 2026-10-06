@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 import spconv.pytorch as spconv
+from spconv.core import ConvAlgo
 from spconv.pytorch.depthwise import SubMConvDepthwise2d
 
 # we must disable tf32 to increase reference precision.
@@ -83,11 +84,11 @@ def _assert_close(a: torch.Tensor, b: torch.Tensor):
 
 
 def _check_against_dense(kernel_size: int, density: float, dilation: int = 1,
-                         bias: bool = True):
+                         bias: bool = True, algo=None):
     torch.manual_seed(0)
     x, mask = _random_input(density)
     conv = _depthwise_conv(kernel_size, dilation, bias)
-    dw = SubMConvDepthwise2d.from_conv2d(conv)
+    dw = SubMConvDepthwise2d.from_conv2d(conv, algo=algo)
     out = dw(_to_sparse(x, mask))
     _assert_close(out.features, _dense_reference(conv, x, mask))
 
@@ -172,6 +173,15 @@ def test_kernel7():
 
 def test_dilation():
     _check_against_dense(3, density=0.6, dilation=2)
+
+
+def test_every_algo():
+    """The default 3x3 builds MaskImplicitGemm; force the other rulebooks,
+    including Native at 3x3, where the mirrored counts matter."""
+    for algo in [ConvAlgo.Native, ConvAlgo.MaskImplicitGemm,
+                 ConvAlgo.MaskSplitImplicitGemm]:
+        _check_against_dense(3, density=0.6, algo=algo)
+    _check_against_dense(7, density=0.6, algo=ConvAlgo.MaskImplicitGemm)
 
 
 def test_backward_matches_dense():
@@ -323,6 +333,7 @@ if __name__ == "__main__":
     test_kernel3_sparse()
     test_kernel7()
     test_dilation()
+    test_every_algo()
     test_backward_matches_dense()
     test_indice_key_reuse()
     test_shares_key_with_subm_conv()

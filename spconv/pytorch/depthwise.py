@@ -57,9 +57,12 @@ class SubMConvDepthwise2d(SparseModule):
         bias: add a per-channel bias.
         indice_key: share the rulebook with other submanifold layers on the
             same active set and the same kernel size and dilation; a mismatch
-            raises ValueError, as in SparseConvolution. The key can be shared
-            with a SubMConv2d using its default algo: this layer reads both
-            rulebook formats, and builds the one that SubMConv2d would.
+            raises ValueError, as in SparseConvolution. This layer reads the
+            rulebook of any algo; when it builds one, it uses `algo`.
+        algo: the algo whose rulebook this layer builds. None picks the
+            default of a SubMConv2d with the same kernel size, so the key can
+            be shared with it; set it to match a SubMConv2d created with an
+            explicit algo. The forward pass is the same for every algo.
 
     Weight layout:
         `weight` is (C, kh, kw, 1). This is spconv's KRSC layout
@@ -78,7 +81,8 @@ class SubMConvDepthwise2d(SparseModule):
                  kernel_size: Union[int, List[int]] = 3,
                  dilation: Union[int, List[int]] = 1,
                  bias: bool = True,
-                 indice_key: Optional[str] = None):
+                 indice_key: Optional[str] = None,
+                 algo: Optional[ConvAlgo] = None):
         super().__init__()
         self.channels = channels
         self.kernel_size = expand_nd(2, kernel_size)
@@ -86,6 +90,19 @@ class SubMConvDepthwise2d(SparseModule):
         self.indice_key = indice_key
         assert all(k % 2 == 1 for k in self.kernel_size), \
             "submanifold conv only supports odd kernel sizes"
+        if algo is None:
+            # same default as SparseConvolutionBase.__init__
+            kv = 1
+            for s in self.kernel_size:
+                kv *= s
+            if kv <= 32 and not CPU_ONLY_BUILD:
+                algo = ConvAlgo.MaskImplicitGemm
+            else:
+                algo = ConvAlgo.Native
+        if CPU_ONLY_BUILD:
+            assert algo == ConvAlgo.Native, \
+                "cpu only build only support native algorithm"
+        self.algo = algo
 
         self.weight = Parameter(torch.zeros(self.channels, *self.kernel_size, 1))
         if bias:
@@ -114,6 +131,7 @@ class SubMConvDepthwise2d(SparseModule):
             s += ', bias=False'
         if self.indice_key is not None:
             s += ', indice_key={indice_key}'
+        s += f', algo={self.algo}'
         return s.format(**self.__dict__)
 
     def _get_rulebook(self, input: SparseConvTensor):
@@ -138,28 +156,26 @@ class SubMConvDepthwise2d(SparseModule):
 
         if isinstance(datas, ImplicitGemmIndiceData):
             return datas.pair_fwd, indice_dict
-        pair_fwd = self._native_to_pair_fwd(datas.indice_pairs,
-                                            datas.indice_pair_num,
-                                            input.indices.shape[0])
+        # convert once per rulebook, not once per layer sharing it
+        pair_fwd = getattr(datas, "_depthwise_pair_fwd", None)
+        if pair_fwd is None:
+            pair_fwd = self._native_to_pair_fwd(datas.indice_pairs,
+                                                datas.indice_pair_num,
+                                                input.indices.shape[0])
+            datas._depthwise_pair_fwd = pair_fwd
         return pair_fwd, indice_dict
 
     def _build_rulebook(
             self, input: SparseConvTensor
     ) -> Union[IndiceData, ImplicitGemmIndiceData]:
-        # Build with the algo a default SubMConv of this kernel size would
-        # pick (SparseConvolutionBase.__init__), so that a SubMConv sharing
-        # the key reuses this rulebook instead of failing its algo assert.
-        kv = 1
-        for s in self.kernel_size:
-            kv *= s
         # subm: stride 1 and padding (k // 2) * dilation are fixed by the
         # index generation kernel (indices.py, generate_subm_conv_inds).
         stride = [1, 1]
         padding = [(k // 2) * d
                    for k, d in zip(self.kernel_size, self.dilation)]
         out_padding = [0, 0]
-        if kv <= 32 and not CPU_ONLY_BUILD:
-            algo = ConvAlgo.MaskImplicitGemm
+        algo = self.algo
+        if algo != ConvAlgo.Native:
             # a SubMConv reusing this in training needs pair_bwd, hence
             # is_train=self.training as in SparseConvolution.
             res = ops.get_indice_pairs_implicit_gemm(
@@ -177,7 +193,6 @@ class SubMConvDepthwise2d(SparseModule):
                 out_spatial_shape=input.spatial_shape, algo=algo,
                 ksize=self.kernel_size, stride=stride, padding=padding,
                 dilation=self.dilation)
-        algo = ConvAlgo.Native
         outids, indice_pairs, indice_pair_num = ops.get_indice_pairs(
             input.indices, input.batch_size, input.spatial_shape, algo,
             self.kernel_size, stride, padding, self.dilation, out_padding,
@@ -206,11 +221,14 @@ class SubMConvDepthwise2d(SparseModule):
         valid = (torch.arange(indice_pairs.shape[2],
                               device=indice_pairs.device)[None]
                  < counts[:, None])
-        k, j = valid.nonzero(as_tuple=True)
-        pair_fwd = torch.full((kv, num_act), -1, dtype=indice_pairs.dtype,
+        # Entries past the count are uninitialised. Send them to an extra
+        # column that is dropped afterwards, rather than filtering them out
+        # with nonzero(), which would sync the GPU.
+        dst = torch.where(valid, indice_pairs[1].long(), num_act)
+        pair_fwd = torch.full((kv, num_act + 1), -1, dtype=indice_pairs.dtype,
                               device=indice_pairs.device)
-        pair_fwd[k, indice_pairs[1, k, j].long()] = indice_pairs[0, k, j]
-        return pair_fwd
+        pair_fwd.scatter_(1, dst, indice_pairs[0])
+        return pair_fwd[:, :num_act]
 
     def _check_subm_reuse_valid(self, input: SparseConvTensor, datas):
         assert datas.is_subm, "only support reuse subm indices"
@@ -238,17 +256,29 @@ class SubMConvDepthwise2d(SparseModule):
         offset, so it accumulates with a plain add: no index_add_, no atomics.
         """
         pair_fwd, indice_dict = self._get_rulebook(input)
-        new_row = input.features.new_zeros((1, self.channels))
-        # zero row LAST, so that pair_fwd's -1 (no neighbour) reads it
-        padded_input = torch.cat([input.features, new_row], dim=0)
+        pair_fwd = pair_fwd.long()  # indexing takes int64: convert once
+        features = input.features
         w = self.weight.reshape(self.channels, -1)  # (C, kh, kw, 1) -> (C, kv)
-        output_features = torch.zeros_like(input.features)
-        for offset_index in range(pair_fwd.shape[0]):
-            output_features += (padded_input[pair_fwd[offset_index]] *
-                                w[:, offset_index])
 
+        # The centre offset maps every row to itself in a submanifold conv,
+        # so it needs no gather (spconv's Native forward skips it too).
+        # Starting from it also replaces a zero fill and a separate bias add.
+        center = pair_fwd.shape[0] // 2
         if self.bias is not None:
-            output_features += self.bias
+            output_features = torch.addcmul(self.bias, features, w[:, center])
+        else:
+            output_features = features * w[:, center]
+
+        # zero row LAST, so that pair_fwd's -1 (no neighbour) reads it
+        new_row = features.new_zeros((1, self.channels))
+        padded_input = torch.cat([features, new_row], dim=0)
+        for offset_index in range(pair_fwd.shape[0]):
+            if offset_index == center:
+                continue
+            # multiply and add in one kernel, no temporary for the product
+            output_features.addcmul_(padded_input[pair_fwd[offset_index]],
+                                     w[:, offset_index])
+
         out_tensor = input.replace_feature(output_features)
         out_tensor.indice_dict = indice_dict
         return out_tensor
@@ -291,16 +321,19 @@ class SubMConvDepthwise2d(SparseModule):
     @classmethod
     def from_conv2d(cls,
                     conv: nn.Conv2d,
-                    indice_key: Optional[str] = None) -> "SubMConvDepthwise2d":
+                    indice_key: Optional[str] = None,
+                    algo: Optional[ConvAlgo] = None) -> "SubMConvDepthwise2d":
         """Build from a depthwise `nn.Conv2d`, on its device and dtype.
 
-        `indice_key` has no dense counterpart, so it is passed separately.
+        `indice_key` and `algo` have no dense counterpart, so they are passed
+        separately.
         """
         mod = cls(conv.in_channels,
                   kernel_size=list(conv.kernel_size),
                   dilation=list(conv.dilation),
                   bias=conv.bias is not None,
-                  indice_key=indice_key)
+                  indice_key=indice_key,
+                  algo=algo)
         mod = mod.to(device=conv.weight.device, dtype=conv.weight.dtype)
         return mod.load_from_conv2d(conv)
 
