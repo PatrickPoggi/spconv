@@ -13,7 +13,7 @@ from spconv.pytorch.conv import (SparseConv1d, SparseConv2d, SparseConv3d,
                                  SparseInverseConv2d, SparseInverseConv3d,
                                  SparseInverseConv4d, SubMConv1d, SubMConv2d,
                                  SubMConv3d, SubMConv4d)
-from spconv.pytorch.depthwise import SubMConvDepthwise2d
+from spconv.pytorch.depthwise import SparseConvDepthwise2d, SubMConvDepthwise2d
 from spconv.pytorch.identity import Identity
 from spconv.pytorch.modules import (SparseModule, SparseSequential,
                                     assign_name_for_sparse_modules, SparseBatchNorm,

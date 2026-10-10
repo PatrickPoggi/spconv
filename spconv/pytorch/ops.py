@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import itertools
 from enum import Enum
 from cumm import tensorview as tv
 from cumm.conv.bases import KRSC, NHWC, ConvOpType
@@ -129,6 +130,150 @@ class _HashData:
                 self.hashdata_v_tv = hashdata_tv[1]
 
 
+def get_child_offsets(ksize: List[int], stride: List[int],
+                      padding: List[int], dilation: List[int]) -> List[int]:
+    """Kernel offsets at which output o of a strided submanifold conv reads
+    its children, the input sites p with p // stride == o.
+
+    Raises ValueError if some child lies outside the kernel window of its
+    parent: a strided submanifold conv keeps exactly the parents of the
+    active sites, so each one must read its children.
+    """
+    positions_per_dim = []
+    for k, s, p, d in zip(ksize, stride, padding, dilation):
+        # output o reads input o * s - p + r * d at kernel position r
+        positions = [r for r in range(k) if 0 <= r * d - p < s]
+        if len(positions) != s:
+            raise ValueError(
+                f"a strided subm conv needs every input site in the kernel"
+                f" window of its output p // stride; ksize {ksize}, stride"
+                f" {stride}, padding {padding}, dilation {dilation} leave some"
+                f" outside (e.g. use dilation 1 and"
+                f" 0 <= padding <= ksize - stride)")
+        positions_per_dim.append(positions)
+    offsets = []
+    for position in itertools.product(*positions_per_dim):
+        offset = 0
+        for r, k in zip(position, ksize):
+            offset = offset * k + r
+        offsets.append(offset)
+    return offsets
+
+
+def check_strided_subm(ksize: List[int], stride: List[int],
+                       padding: List[int], dilation: List[int],
+                       algo: ConvAlgo):
+    """Raises ValueError unless a strided submanifold conv supports these
+    parameters (see get_indice_pairs, get_indice_pairs_implicit_gemm)."""
+    get_child_offsets(ksize, stride, padding, dilation)
+    kv = functools.reduce(lambda x, y: x * y, ksize, 1)
+    if algo == ConvAlgo.MaskSplitImplicitGemm or (
+            algo == ConvAlgo.MaskImplicitGemm and kv > 32):
+        raise ValueError(
+            f"a strided subm conv supports Native, and MaskImplicitGemm with"
+            f" kernel volume <= 32; got {algo} with kernel volume {kv}")
+
+
+def indice_pairs_to_pair_fwd(indice_pairs: torch.Tensor,
+                             indice_pair_num: torch.Tensor, num_out: int,
+                             subm: bool) -> torch.Tensor:
+    """A Native rulebook in the implicit gemm format: pair_fwd (kv, num_out),
+    pair_fwd[k, i] is the input row that output row i reads at offset k, or
+    -1. subm is for the symmetric rulebook of a stride 1 subm conv.
+    """
+    # indice_pairs[0, k, j] is the input row, [1, k, j] the output row, for
+    # the first indice_pair_num[k] entries j of each offset k.
+    kv = indice_pairs.shape[1]
+    counts = indice_pair_num.to(indice_pairs.device)
+    if subm:
+        # The subm kernel runs only offsets 0..centre and writes each pair's
+        # mirror at kv - 1 - k, so only those counts are stored: the centre
+        # covers all num_out rows, and offset k > centre has the count of
+        # kv - 1 - k. This is how indice_conv reads them too.
+        center = kv // 2
+        counts = counts.clone()
+        counts[center] = num_out
+        counts[center + 1:] = counts[:center].flip(0)
+    valid = (torch.arange(indice_pairs.shape[2],
+                          device=indice_pairs.device)[None] < counts[:, None])
+    # Entries past the count are uninitialised. Send them to an extra column
+    # that is dropped afterwards, rather than filtering them out with
+    # nonzero(), which would sync the GPU.
+    dst = torch.where(valid, indice_pairs[1].long(), num_out)
+    pair_fwd = torch.full((kv, num_out + 1), -1, dtype=indice_pairs.dtype,
+                          device=indice_pairs.device)
+    pair_fwd.scatter_(1, dst, indice_pairs[0])
+    return pair_fwd[:, :num_out].contiguous()
+
+
+def pair_fwd_to_indice_pairs(pair_fwd: torch.Tensor, num_in: int):
+    """The inverse of indice_pairs_to_pair_fwd for a regular rulebook: each
+    offset's (input row, output row) pairs packed at the front of its row of
+    indice_pairs (2, kv, num_in), with their count in indice_pair_num (kv,).
+    """
+    kv, num_out = pair_fwd.shape
+    valid = pair_fwd != -1
+    # An input row appears at most once per offset, so num_in slots fit.
+    # Invalid pairs go to an extra slot that is dropped afterwards.
+    slot = torch.where(valid, torch.cumsum(valid, 1) - 1, num_in)
+    out_rows = torch.arange(num_out, dtype=pair_fwd.dtype,
+                            device=pair_fwd.device).expand(kv, num_out)
+    indice_pairs = torch.full((2, kv, num_in + 1), -1, dtype=pair_fwd.dtype,
+                              device=pair_fwd.device)
+    indice_pairs[0].scatter_(1, slot, pair_fwd)
+    indice_pairs[1].scatter_(1, slot, out_rows)
+    indice_pair_num = valid.sum(1).to(pair_fwd.dtype)
+    return indice_pairs[:, :, :num_in].contiguous(), indice_pair_num
+
+
+def _keep_parents(pair_fwd: torch.Tensor, ksize: List[int], stride: List[int],
+                  padding: List[int], dilation: List[int]) -> torch.Tensor:
+    """Bool mask over the outputs of a regular rulebook: the parents
+    p // stride of the active sites p, i.e. the outputs that read a child."""
+    child_offsets = get_child_offsets(ksize, stride, padding, dilation)
+    return (pair_fwd[child_offsets] != -1).any(0)
+
+
+def _cut_implicit_gemm_pairs(res, keep: torch.Tensor):
+    """Removes the outputs where keep is False from the result of
+    get_indice_pairs_implicit_gemm for a regular conv (MaskImplicitGemm,
+    kernel volume <= 32)."""
+    (out_inds, _, pair_fwd, pair_bwd, pair_mask_fwd_splits,
+     pair_mask_bwd_splits, mask_argsort_fwd_splits, mask_argsort_bwd_splits,
+     masks) = res
+    assert len(pair_mask_fwd_splits) == 1 and pair_mask_fwd_splits[0].shape[1] == 1
+    new_row = (torch.cumsum(keep, 0) - 1).to(pair_fwd.dtype)
+
+    # The kept outputs keep their pairs, so their masks do not change. Masks
+    # are stored sorted, in mask_argsort order: dropping the cut outputs'
+    # entries keeps the rest sorted.
+    argsort = mask_argsort_fwd_splits[0].long()
+    kept = keep[argsort]
+    pair_mask_fwd = pair_mask_fwd_splits[0][kept]
+    mask_argsort_fwd = new_row[argsort[kept]]
+    pair_fwd = pair_fwd[:, keep].contiguous()
+
+    # The inputs lose their pairs with cut outputs, so their masks are
+    # recomputed: bit k set iff pair k exists (calc_conv_indices_stage2_mask_output),
+    # then sorted.
+    out_rows = pair_bwd.long()
+    valid = out_rows != -1
+    out_rows = torch.where(valid, out_rows, 0)
+    valid = valid & keep[out_rows]
+    pair_bwd = torch.where(valid, new_row[out_rows], -1)
+    bits = torch.arange(pair_bwd.shape[0], device=pair_bwd.device)
+    mask_bwd = (valid.long() << bits[:, None]).sum(0)
+    mask_bwd, mask_argsort_bwd = torch.sort(mask_bwd)
+    # uint32 masks live in int32 tensors
+    mask_bwd = torch.where(mask_bwd >= 2**31, mask_bwd - 2**32, mask_bwd)
+    pair_mask_bwd = mask_bwd.to(torch.int32).view(-1, 1)
+
+    indice_num_per_loc = (pair_fwd != -1).sum(1).to(torch.int32)
+    return (out_inds[keep], indice_num_per_loc, pair_fwd, pair_bwd,
+            [pair_mask_fwd], [pair_mask_bwd], [mask_argsort_fwd],
+            [mask_argsort_bwd.to(torch.int32)], masks)
+
+
 def get_indice_pairs(indices: torch.Tensor,
                      batch_size: int,
                      spatial_shape: List[int],
@@ -141,6 +286,20 @@ def get_indice_pairs(indices: torch.Tensor,
                      subm: bool = False,
                      transpose: bool = False,
                      num_out_act_bound: int = -1):
+    if subm and any(s != 1 for s in stride):
+        # A subm conv with stride keeps the parents p // stride of the active
+        # sites p, so the active set never grows: the regular rulebook without
+        # the outputs that are no site's parent. It is not symmetric, so the
+        # kernels must treat it as a regular rulebook.
+        out_inds, pair, indice_num_per_loc = get_indice_pairs(
+            indices, batch_size, spatial_shape, algo, ksize, stride, padding,
+            dilation, out_padding, False, transpose, num_out_act_bound)
+        pair_fwd = indice_pairs_to_pair_fwd(pair, indice_num_per_loc,
+                                            out_inds.shape[0], subm=False)
+        keep = _keep_parents(pair_fwd, ksize, stride, padding, dilation)
+        pair, indice_num_per_loc = pair_fwd_to_indice_pairs(
+            pair_fwd[:, keep], indices.shape[0])
+        return out_inds[keep], pair, indice_num_per_loc
     # torch.cuda.synchronize()
     # t = time.time()
     # stream = get_current_stream()
@@ -360,6 +519,17 @@ def get_indice_pairs_implicit_gemm(
     direct_table: a hash-based regular conv pair gen algo to avoid unique operation.
     runs faster than pytorch unique with num_voxel < 1000k.
     """
+    if subm and any(s != 1 for s in stride):
+        # See get_indice_pairs. Built with the bwd pairs, which a regular
+        # rulebook always has (it may be inversed).
+        res = get_indice_pairs_implicit_gemm(
+            indices, batch_size, spatial_shape, algo, ksize, stride, padding,
+            dilation, out_padding, subm=False, transpose=transpose,
+            is_train=True, alloc=alloc, timer=timer,
+            num_out_act_bound=num_out_act_bound, direct_table=direct_table,
+            do_sort=do_sort)
+        keep = _keep_parents(res[2], ksize, stride, padding, dilation)
+        return _cut_implicit_gemm_pairs(res, keep)
     stream = get_current_stream()
     if SPCONV_CPP_INDICE_PAIRS_IGEMM:
         thalloc = TorchAllocator(indices.device)

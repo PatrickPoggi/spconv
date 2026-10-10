@@ -123,6 +123,12 @@ class SparseConvolutionBase:
         if CPU_ONLY_BUILD:
             assert algo == ConvAlgo.Native, "cpu only build only support native algorithm"
         self.algo = algo
+        # A subm conv with stride keeps the parents p // stride of the active
+        # sites p, so it does not grow the active set (ops.get_indice_pairs).
+        self.strided_subm = subm and self.stride != [1] * ndim
+        if self.strided_subm:
+            ops.check_strided_subm(self.kernel_size, self.stride,
+                                   self.padding, self.dilation, algo)
         self.fp32_accum = fp32_accum
         # self.algo = ConvAlgo.Native
 
@@ -146,7 +152,8 @@ class SparseConvolutionBase:
             assert act_type == tv.gemm.Activation.None_, "conv1x1 don't support fused act"
 
     def is_inverseable(self):
-        return self.indice_key is not None and not self.subm
+        return self.indice_key is not None and (not self.subm
+                                                or self.strided_subm)
 
     def _conv_forward(self,
                       training: bool,
@@ -183,7 +190,7 @@ class SparseConvolutionBase:
             msg = "act don't support backward, only used in inference"
             assert self.act_type == tv.gemm.Activation.None_, msg
 
-        if not self.subm:
+        if not self.subm or self.strided_subm:
             if self.transposed:
                 out_spatial_shape = ops.get_deconv_output_size(
                     spatial_shape, self.kernel_size, self.stride, self.padding,
@@ -240,6 +247,8 @@ class SparseConvolutionBase:
             out_tensor.spatial_shape = out_spatial_shape
             return out_tensor
         indice_dict = input.indice_dict.copy()
+        # the kernels' subm path needs the symmetric rulebook of stride 1
+        kernel_subm = self.subm and not self.strided_subm
         # only support contiguous tensor for now
         if not features.is_contiguous():
             features = features.contiguous()
@@ -260,7 +269,7 @@ class SparseConvolutionBase:
                     assert isinstance(datas, IndiceData)
                 if self.inverse:
                     assert datas is not None and self.indice_key is not None
-                    assert datas.is_subm is False, "inverse conv can only be used with standard conv and pool ops."
+                    assert not datas.is_subm or datas.stride != [1] * self.ndim, "inverse conv can only be used with standard conv, strided subm conv and pool ops."
 
                     outids = datas.indices
                     indice_pairs = datas.indice_pairs
@@ -323,7 +332,7 @@ class SparseConvolutionBase:
                 indice_pairs_calc = indice_pairs
                 if indice_pairs.device != features.device:
                     indice_pairs_calc = indice_pairs.to(features.device)
-                if self.subm:
+                if kernel_subm:
                     out_features = Fsp.indice_subm_conv(
                         features, weight, indice_pairs_calc, indice_pair_num,
                         outids.shape[0], algo, input._timer, bias_for_infer,
@@ -347,7 +356,7 @@ class SparseConvolutionBase:
                     assert isinstance(datas, ImplicitGemmIndiceData)
                 if self.inverse:
                     assert datas is not None and self.indice_key is not None
-                    assert datas.is_subm is False, "inverse conv can only be used with standard conv and pool ops."
+                    assert not datas.is_subm or datas.stride != [1] * self.ndim, "inverse conv can only be used with standard conv, strided subm conv and pool ops."
                     outids = datas.indices
                     pair_fwd = datas.pair_bwd
                     pair_bwd = datas.pair_fwd
@@ -457,7 +466,7 @@ class SparseConvolutionBase:
                         features, weight_cur, pair_fwd, pair_bwd,
                         pair_mask_fwd_splits, pair_mask_bwd_splits,
                         mask_argsort_fwd_splits, mask_argsort_bwd_splits,
-                        num_activate_out, masks, training, self.subm,
+                        num_activate_out, masks, training, kernel_subm,
                         input._timer, self.fp32_accum, bias_cur, act_alpha,
                         act_beta, act_type)
                 else:
@@ -473,7 +482,7 @@ class SparseConvolutionBase:
                         num_activate_out,
                         masks,
                         training,
-                        self.subm,
+                        kernel_subm,
                         input._timer,
                         self.fp32_accum,
                         bias_cur,
@@ -529,6 +538,14 @@ class SparseConvolutionBase:
             raise ValueError(
                 f"subm with same indice_key must have same dilation"
                 f", expect {datas.dilation}, this layer {self.dilation}")
+        if self.stride != datas.stride:
+            raise ValueError(
+                f"subm with same indice_key must have same stride"
+                f", expect {datas.stride}, this layer {self.stride}")
+        if self.strided_subm and self.padding != datas.padding:
+            raise ValueError(
+                f"strided subm with same indice_key must have same padding"
+                f", expect {datas.padding}, this layer {self.padding}")
         if inp.spatial_shape != datas.spatial_shape:
             raise ValueError(
                 f"subm with same indice_key must have same spatial structure"

@@ -12,24 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Submanifold depthwise convolution.
+"""Depthwise sparse convolutions.
 
 `SparseConvolutionBase` asserts `groups == 1`, so no grouped or depthwise
 convolution exists in spconv. This provides the depthwise case, which is the one
 that matters for mobile-style backbones (MobileNet, EfficientNet, YOLO's CIB
-blocks) where a depthwise 3x3 or 7x7 sits between pointwise projections.
+blocks): a depthwise 3x3 or 7x7 between pointwise projections, and a strided
+depthwise conv to downsample (YOLOv10's SCDown).
 
-Depthwise is the easy case: no channel mixing, so the output at an active site is
-a weighted sum of THAT SITE'S OWN CHANNEL across the kernel offsets.
+Depthwise is the easy case: no channel mixing, so an output site is a weighted
+sum of ITS OWN CHANNEL across the kernel offsets.
 
     out[i, c] = sum_k  weight[k, c] * in[rulebook[k][i], c]   (+ bias[c])
 
-No GEMM is needed. The rulebook is the same one a submanifold `SubMConv` builds,
-so this reuses it when an `indice_key` hits and builds it otherwise.
+No GEMM is needed. The rulebooks are spconv's own (ops.get_indice_pairs and
+ops.get_indice_pairs_implicit_gemm) and are shared through `indice_key` as for
+the other sparse convolutions.
 """
 
 import math
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -39,62 +41,85 @@ from torch.nn.parameter import Parameter
 from spconv.core import ConvAlgo
 from spconv.cppconstants import CPU_ONLY_BUILD
 from spconv.pytorch import ops
+from spconv.pytorch.conv import SparseConvolutionBase
 from spconv.pytorch.core import (IndiceData, ImplicitGemmIndiceData,
                                  SparseConvTensor, expand_nd)
 from spconv.pytorch.modules import SparseModule
 
 
-class SubMConvDepthwise2d(SparseModule):
-    """Depthwise submanifold sparse convolution.
+class SparseDepthwiseConvolution(SparseModule):
+    """Depthwise sparse convolution: one kernel per channel, no channel mixing.
 
-    One kernel per channel, no channel mixing, and the active set is unchanged --
-    output sites are exactly the input sites.
+    The counterpart of SparseConvolution for groups == channels.
 
     Args:
+        ndim: number of spatial dimensions.
         channels: both in and out; depthwise cannot change the channel count.
-        kernel_size: int or [kh, kw].
-        dilation: int or [dh, dw].
+        kernel_size, stride, padding, dilation: as in SparseConvolution.
         bias: add a per-channel bias.
-        indice_key: share the rulebook with other submanifold layers on the
-            same active set and the same kernel size and dilation; a mismatch
-            raises ValueError, as in SparseConvolution. This layer reads the
-            rulebook of any algo; when it builds one, it uses `algo`.
-        algo: the algo whose rulebook this layer builds. None picks the
-            default of a SubMConv2d with the same kernel size, so the key can
-            be shared with it; set it to match a SubMConv2d created with an
-            explicit algo. The forward pass is the same for every algo.
+        subm: submanifold, as in SparseConvolution: the active set never
+            grows. With stride 1 the output sites are exactly the input
+            sites, and padding is always (k // 2) * dilation (SubMConv
+            ignores the argument too). With stride > 1 an output site is
+            active iff it is the parent p // stride of an active input site p
+            (ops.get_indice_pairs).
+            Otherwise the conv is regular, as SparseConv: an output site is
+            active iff its kernel window holds an active input site, so the
+            active set grows.
+        indice_key: as in SparseConvolution. A submanifold layer shares its
+            rulebook with the submanifold layers (SubMConv included) on the
+            same active set with the same kernel size, dilation, stride and
+            padding; a mismatch raises ValueError. It reads the rulebook of
+            any algo. A regular or strided layer stores its rulebook for an
+            inverse conv (SparseInverseConv with the same key and algo).
+        algo: the algo whose rulebook this layer builds; None picks the
+            default of a SparseConvolution with the same kernel size, so the
+            key can be shared with it. The forward pass is the same for every
+            algo.
 
     Weight layout:
-        `weight` is (C, kh, kw, 1). This is spconv's KRSC layout
-        (Cout, kh, kw, Cin) with Cin/groups = 1, i.e. exactly the shape a
-        `SubMConv2d(C, C, k, groups=C)` would have if spconv supported groups,
-        so a future grouped implementation can take these weights unchanged.
-        Kernel offset k of the rulebook is weight.reshape(C, -1)[:, k], the
-        same row-major flattening of (kh, kw) the Native algorithm uses for
-        every other spconv weight.
+        `weight` is (C, *kernel_size, 1). This is spconv's KRSC layout
+        (Cout, *kernel_size, Cin) with Cin/groups = 1, i.e. exactly the shape
+        a SparseConvolution with groups=C would have if spconv supported
+        groups, so a future grouped implementation can take these weights
+        unchanged. Kernel offset k of the rulebook is
+        weight.reshape(C, -1)[:, k], the same row-major flattening of the
+        kernel the Native algorithm uses for every other spconv weight.
 
         `load_from_conv2d` converts from PyTorch's (C, 1, kh, kw).
     """
 
     def __init__(self,
+                 ndim: int,
                  channels: int,
-                 kernel_size: Union[int, List[int]] = 3,
-                 dilation: Union[int, List[int]] = 1,
+                 kernel_size: Union[int, List[int], Tuple[int, ...]] = 3,
+                 stride: Union[int, List[int], Tuple[int, ...]] = 1,
+                 padding: Union[int, List[int], Tuple[int, ...]] = 0,
+                 dilation: Union[int, List[int], Tuple[int, ...]] = 1,
                  bias: bool = True,
+                 subm: bool = False,
                  indice_key: Optional[str] = None,
                  algo: Optional[ConvAlgo] = None):
         super().__init__()
+        self.ndim = ndim
         self.channels = channels
-        self.kernel_size = expand_nd(2, kernel_size)
-        self.dilation = expand_nd(2, dilation)
+        self.kernel_size = expand_nd(ndim, kernel_size)
+        self.stride = expand_nd(ndim, stride)
+        self.padding = expand_nd(ndim, padding)
+        self.dilation = expand_nd(ndim, dilation)
+        self.subm = subm
+        self.strided_subm = subm and self.stride != [1] * ndim
         self.indice_key = indice_key
-        assert all(k % 2 == 1 for k in self.kernel_size), \
-            "submanifold conv only supports odd kernel sizes"
+        if subm and not self.strided_subm:
+            assert all(k % 2 == 1 for k in self.kernel_size), \
+                "submanifold conv only supports odd kernel sizes"
+            self.padding = [(k // 2) * d
+                            for k, d in zip(self.kernel_size, self.dilation)]
         if algo is None:
             # same default as SparseConvolutionBase.__init__
             kv = 1
-            for s in self.kernel_size:
-                kv *= s
+            for k in self.kernel_size:
+                kv *= k
             if kv <= 32 and not CPU_ONLY_BUILD:
                 algo = ConvAlgo.MaskImplicitGemm
             else:
@@ -103,6 +128,9 @@ class SubMConvDepthwise2d(SparseModule):
             assert algo == ConvAlgo.Native, \
                 "cpu only build only support native algorithm"
         self.algo = algo
+        if self.strided_subm:
+            ops.check_strided_subm(self.kernel_size, self.stride,
+                                   self.padding, self.dilation, algo)
 
         self.weight = Parameter(torch.zeros(self.channels, *self.kernel_size, 1))
         if bias:
@@ -114,7 +142,7 @@ class SubMConvDepthwise2d(SparseModule):
     def reset_parameters(self):
         # kaiming_uniform_ with a=sqrt(5), as SparseConvolution uses, reduces
         # to bound = 1 / sqrt(fan_in). Depthwise sums one channel only, so
-        # fan_in is kh * kw, not in_channels * kh * kw as in SparseConvolution.
+        # fan_in is the kernel volume, not in_channels times it.
         fan_in = 1
         for s in self.kernel_size:
             fan_in *= s
@@ -125,6 +153,10 @@ class SubMConvDepthwise2d(SparseModule):
 
     def extra_repr(self) -> str:
         s = '{channels}, kernel_size={kernel_size}'
+        if not self.subm or self.strided_subm:
+            s += ', stride={stride}'
+            if self.padding != [0] * len(self.padding):
+                s += ', padding={padding}'
         if self.dilation != [1] * len(self.dilation):
             s += ', dilation={dilation}'
         if self.bias is None:
@@ -135,161 +167,136 @@ class SubMConvDepthwise2d(SparseModule):
         return s.format(**self.__dict__)
 
     def _get_rulebook(self, input: SparseConvTensor):
-        """Gather table for the kernel offsets, cached or freshly built.
+        """The rulebook for this input, cached or freshly built.
 
-        Returns (pair_fwd, indice_dict). pair_fwd is (kh * kw, N):
-        pair_fwd[k, i] is the input row that output row i reads at offset k,
-        or -1 if that neighbour is inactive. This is the implicit gemm format;
-        a Native rulebook is converted to it. indice_dict is for the output
-        tensor: as in SparseConvolution, a new rulebook goes into a copy of
-        the input's dict, and the input is left unchanged.
+        Returns (datas, pair_fwd, indice_dict). datas is spconv's IndiceData
+        or ImplicitGemmIndiceData, with the output indices and spatial shape.
+        pair_fwd is (kernel volume, num_out): pair_fwd[k, i] is the input row
+        that output row i reads at offset k, or -1 if that site is inactive.
+        This is the implicit gemm format; a Native rulebook is converted to
+        it. indice_dict is for the output tensor: as in SparseConvolution, a
+        new rulebook goes into a copy of the input's dict, and the input is
+        left unchanged.
         """
         indice_dict = input.indice_dict.copy()
         datas = input.find_indice_pair(self.indice_key)
         if datas is not None:
-            # same checks as SparseConvolution._check_subm_reuse_valid
-            self._check_subm_reuse_valid(input, datas)
+            # as in SparseConvolution: only subm rulebooks are reused, a
+            # regular conv's key is for its inverse conv
+            assert self.subm, "only support reuse subm indices"
+            SparseConvolutionBase._check_subm_reuse_valid(
+                self, input, input.spatial_shape, datas)
         else:
             datas = self._build_rulebook(input)
             if self.indice_key is not None:
                 indice_dict[self.indice_key] = datas
 
         if isinstance(datas, ImplicitGemmIndiceData):
-            return datas.pair_fwd, indice_dict
+            return datas, datas.pair_fwd, indice_dict
         # convert once per rulebook, not once per layer sharing it
         pair_fwd = getattr(datas, "_depthwise_pair_fwd", None)
         if pair_fwd is None:
-            pair_fwd = self._native_to_pair_fwd(datas.indice_pairs,
-                                                datas.indice_pair_num,
-                                                input.indices.shape[0])
+            symmetric = datas.is_subm and datas.stride == [1] * self.ndim
+            pair_fwd = ops.indice_pairs_to_pair_fwd(datas.indice_pairs,
+                                                    datas.indice_pair_num,
+                                                    datas.out_indices.shape[0],
+                                                    subm=symmetric)
             datas._depthwise_pair_fwd = pair_fwd
-        return pair_fwd, indice_dict
+        return datas, pair_fwd, indice_dict
 
     def _build_rulebook(
             self, input: SparseConvTensor
     ) -> Union[IndiceData, ImplicitGemmIndiceData]:
-        # subm: stride 1 and padding (k // 2) * dilation are fixed by the
-        # index generation kernel (indices.py, generate_subm_conv_inds).
-        stride = [1, 1]
-        padding = [(k // 2) * d
-                   for k, d in zip(self.kernel_size, self.dilation)]
-        out_padding = [0, 0]
-        algo = self.algo
-        if algo != ConvAlgo.Native:
-            # a SubMConv reusing this in training needs pair_bwd, hence
-            # is_train=self.training as in SparseConvolution.
-            res = ops.get_indice_pairs_implicit_gemm(
-                input.indices, input.batch_size, input.spatial_shape, algo,
-                ksize=self.kernel_size, stride=stride, padding=padding,
-                dilation=self.dilation, out_padding=out_padding, subm=True,
-                transpose=False, is_train=self.training,
-                alloc=input.thrust_allocator, timer=input._timer)
-            return ImplicitGemmIndiceData(
-                res[0], input.indices, res[2], res[3],
-                pair_mask_fwd_splits=res[4], pair_mask_bwd_splits=res[5],
-                mask_argsort_fwd_splits=res[6],
-                mask_argsort_bwd_splits=res[7], masks=res[8], is_subm=True,
-                spatial_shape=input.spatial_shape,
-                out_spatial_shape=input.spatial_shape, algo=algo,
-                ksize=self.kernel_size, stride=stride, padding=padding,
-                dilation=self.dilation)
-        outids, indice_pairs, indice_pair_num = ops.get_indice_pairs(
-            input.indices, input.batch_size, input.spatial_shape, algo,
-            self.kernel_size, stride, padding, self.dilation, out_padding,
-            subm=True)
-        return IndiceData(outids, input.indices, indice_pairs,
-                          indice_pair_num, input.spatial_shape,
-                          input.spatial_shape, is_subm=True, algo=algo,
-                          ksize=self.kernel_size, stride=stride,
-                          dilation=self.dilation, padding=padding)
-
-    @staticmethod
-    def _native_to_pair_fwd(indice_pairs: torch.Tensor,
-                            indice_pair_num: torch.Tensor,
-                            num_act: int) -> torch.Tensor:
-        # indice_pairs[0, k, j] is the input row, [1, k, j] the output row
-        # (indices.py, calc_subm_conv_indices). For subm the kernel runs only
-        # offsets 0..centre and writes each pair's mirror at kv - 1 - k, so
-        # only those counts are stored: the centre covers all num_act rows,
-        # and offset k > centre has the count of kv - 1 - k. This is how
-        # ops.indice_conv reads them too.
-        kv = indice_pairs.shape[1]
-        center = kv // 2
-        counts = indice_pair_num.to(indice_pairs.device).clone()
-        counts[center] = num_act
-        counts[center + 1:] = counts[:center].flip(0)
-        valid = (torch.arange(indice_pairs.shape[2],
-                              device=indice_pairs.device)[None]
-                 < counts[:, None])
-        # Entries past the count are uninitialised. Send them to an extra
-        # column that is dropped afterwards, rather than filtering them out
-        # with nonzero(), which would sync the GPU.
-        dst = torch.where(valid, indice_pairs[1].long(), num_act)
-        pair_fwd = torch.full((kv, num_act + 1), -1, dtype=indice_pairs.dtype,
-                              device=indice_pairs.device)
-        pair_fwd.scatter_(1, dst, indice_pairs[0])
-        return pair_fwd[:, :num_act]
-
-    def _check_subm_reuse_valid(self, input: SparseConvTensor, datas):
-        assert datas.is_subm, "only support reuse subm indices"
-        if self.kernel_size != datas.ksize:
-            raise ValueError(
-                f"subm with same indice_key must have same kernel"
-                f" size, expect {datas.ksize}, this layer {self.kernel_size}")
-        if self.dilation != datas.dilation:
-            raise ValueError(
-                f"subm with same indice_key must have same dilation"
-                f", expect {datas.dilation}, this layer {self.dilation}")
-        if input.spatial_shape != datas.spatial_shape:
-            raise ValueError(
-                f"subm with same indice_key must have same spatial structure"
-                f", expect {datas.spatial_shape}, input {input.spatial_shape}")
-        if input.indices.shape[0] != datas.indices.shape[0]:
-            raise ValueError(
-                f"subm with same indice_key must have same num of indices"
-                f", expect {datas.indices.shape[0]}, input {input.indices.shape[0]}")
+        # as in SparseConvolution._conv_forward
+        if self.subm and not self.strided_subm:
+            out_spatial_shape = input.spatial_shape
+        else:
+            out_spatial_shape = ops.get_conv_output_size(
+                input.spatial_shape, self.kernel_size, self.stride,
+                self.padding, self.dilation)
+        out_padding = [0] * self.ndim
+        if self.algo == ConvAlgo.Native:
+            outids, indice_pairs, indice_pair_num = ops.get_indice_pairs(
+                input.indices, input.batch_size, input.spatial_shape,
+                self.algo, self.kernel_size, self.stride, self.padding,
+                self.dilation, out_padding, self.subm)
+            return IndiceData(outids, input.indices, indice_pairs,
+                              indice_pair_num, input.spatial_shape,
+                              out_spatial_shape, is_subm=self.subm,
+                              algo=self.algo, ksize=self.kernel_size,
+                              stride=self.stride, dilation=self.dilation,
+                              padding=self.padding)
+        # a regular rulebook gets the bwd pairs in any case, for an inverse
+        # conv; a subm one when a SubMConv reusing it may train
+        res = ops.get_indice_pairs_implicit_gemm(
+            input.indices, input.batch_size, input.spatial_shape, self.algo,
+            ksize=self.kernel_size, stride=self.stride, padding=self.padding,
+            dilation=self.dilation, out_padding=out_padding, subm=self.subm,
+            transpose=False, is_train=(not self.subm) or self.training,
+            alloc=input.thrust_allocator, timer=input._timer)
+        return ImplicitGemmIndiceData(
+            res[0], input.indices, res[2], res[3],
+            pair_mask_fwd_splits=res[4], pair_mask_bwd_splits=res[5],
+            mask_argsort_fwd_splits=res[6], mask_argsort_bwd_splits=res[7],
+            masks=res[8], is_subm=self.subm,
+            spatial_shape=input.spatial_shape,
+            out_spatial_shape=out_spatial_shape, algo=self.algo,
+            ksize=self.kernel_size, stride=self.stride, padding=self.padding,
+            dilation=self.dilation)
 
     def forward(self, input: SparseConvTensor) -> SparseConvTensor:
-        """(N, C) features in, (N, C) out, same coordinates.
+        """(N, C) features in, (num_out, C) out.
 
         One gather per kernel offset. Each output row appears at most once per
         offset, so it accumulates with a plain add: no index_add_, no atomics.
         """
-        pair_fwd, indice_dict = self._get_rulebook(input)
+        datas, pair_fwd, indice_dict = self._get_rulebook(input)
         pair_fwd = pair_fwd.long()  # indexing takes int64: convert once
         features = input.features
-        w = self.weight.reshape(self.channels, -1)  # (C, kh, kw, 1) -> (C, kv)
+        w = self.weight.reshape(self.channels, -1)  # (C, *k, 1) -> (C, kv)
+        num_offsets, num_out = pair_fwd.shape
 
-        # The centre offset maps every row to itself in a submanifold conv,
-        # so it needs no gather (spconv's Native forward skips it too).
-        # Starting from it also replaces a zero fill and a separate bias add.
-        center = pair_fwd.shape[0] // 2
-        if self.bias is not None:
-            output_features = torch.addcmul(self.bias, features, w[:, center])
+        bias = self.bias
+        if bias is None:
+            bias = features.new_zeros(self.channels)
+        if self.subm and not self.strided_subm:
+            # The centre offset maps every row to itself in a stride 1 subm
+            # conv, so it needs no gather (spconv's Native forward skips it
+            # too). It starts the sum, with the bias folded in.
+            center = num_offsets // 2
+            output_features = torch.addcmul(bias, features, w[:, center])
         else:
-            output_features = features * w[:, center]
+            center = None
+            output_features = bias.repeat(num_out, 1)
 
         # zero row LAST, so that pair_fwd's -1 (no neighbour) reads it
         new_row = features.new_zeros((1, self.channels))
         padded_input = torch.cat([features, new_row], dim=0)
-        for offset_index in range(pair_fwd.shape[0]):
+        for offset_index in range(num_offsets):
             if offset_index == center:
                 continue
             # multiply and add in one kernel, no temporary for the product
             output_features.addcmul_(padded_input[pair_fwd[offset_index]],
                                      w[:, offset_index])
 
-        out_tensor = input.replace_feature(output_features)
+        # assembled as in SparseConvolution
+        out_tensor = input.shadow_copy()
+        out_tensor = out_tensor.replace_feature(output_features)
+        out_tensor.indices = datas.out_indices
         out_tensor.indice_dict = indice_dict
+        out_tensor.spatial_shape = datas.out_spatial_shape
         return out_tensor
 
     @torch.no_grad()
-    def load_from_conv2d(self, conv: nn.Conv2d) -> "SubMConvDepthwise2d":
+    def load_from_conv2d(self,
+                         conv: nn.Conv2d) -> "SparseDepthwiseConvolution":
         """Copy weights from an equivalent `nn.Conv2d(C, C, k, groups=C)`.
 
-        The conv must compute the same function at the active sites: one
-        filter per channel, stride 1 and "same" padding. Anything else raises
-        ValueError rather than loading weights into a different operator.
+        The conv must compute the same function at the output sites: one
+        filter per channel, the same stride and dilation, and the same
+        padding (for a stride 1 subm layer, the "same" padding). Anything
+        else raises ValueError rather than loading weights into a different
+        operator.
         """
         if (conv.groups != self.channels or conv.in_channels != self.channels
                 or conv.out_channels != self.channels):
@@ -298,17 +305,13 @@ class SubMConvDepthwise2d(SparseModule):
         if list(conv.kernel_size) != self.kernel_size:
             raise ValueError(f"kernel_size mismatch: conv {list(conv.kernel_size)}"
                              f", this layer {self.kernel_size}")
-        if list(conv.dilation) != self.dilation or list(conv.stride) != [1, 1]:
-            raise ValueError(f"expected stride [1, 1] and dilation"
-                             f" {self.dilation}, got stride {list(conv.stride)}"
-                             f", dilation {list(conv.dilation)}")
-        # submanifold output sites are the input sites: the dense equivalent
-        # is the "same" padding, (k // 2) * dilation
-        same_padding = [(k // 2) * d
-                        for k, d in zip(self.kernel_size, self.dilation)]
-        if list(conv.padding) != same_padding:
+        if (list(conv.stride) != self.stride
+                or list(conv.padding) != self.padding
+                or list(conv.dilation) != self.dilation):
             raise ValueError(
-                f"expected padding {same_padding}, got {conv.padding}")
+                f"expected stride {self.stride}, padding {self.padding} and"
+                f" dilation {self.dilation}, got stride {list(conv.stride)},"
+                f" padding {conv.padding}, dilation {list(conv.dilation)}")
         if (conv.bias is None) != (self.bias is None):
             raise ValueError("bias presence differs between conv and this layer")
 
@@ -322,7 +325,8 @@ class SubMConvDepthwise2d(SparseModule):
     def from_conv2d(cls,
                     conv: nn.Conv2d,
                     indice_key: Optional[str] = None,
-                    algo: Optional[ConvAlgo] = None) -> "SubMConvDepthwise2d":
+                    algo: Optional[ConvAlgo] = None
+                    ) -> "SparseDepthwiseConvolution":
         """Build from a depthwise `nn.Conv2d`, on its device and dtype.
 
         `indice_key` and `algo` have no dense counterpart, so they are passed
@@ -330,6 +334,8 @@ class SubMConvDepthwise2d(SparseModule):
         """
         mod = cls(conv.in_channels,
                   kernel_size=list(conv.kernel_size),
+                  stride=list(conv.stride),
+                  padding=list(conv.padding),
                   dilation=list(conv.dilation),
                   bias=conv.bias is not None,
                   indice_key=indice_key,
@@ -337,3 +343,53 @@ class SubMConvDepthwise2d(SparseModule):
         mod = mod.to(device=conv.weight.device, dtype=conv.weight.dtype)
         return mod.load_from_conv2d(conv)
 
+
+class SubMConvDepthwise2d(SparseDepthwiseConvolution):
+    """Depthwise SubMConv2d: the active set never grows. With stride > 1 the
+    output sites are the parents p // stride of the active input sites p."""
+
+    def __init__(self,
+                 channels,
+                 kernel_size,
+                 stride=1,
+                 padding=0,
+                 dilation=1,
+                 bias=True,
+                 indice_key=None,
+                 algo: Optional[ConvAlgo] = None):
+        super(SubMConvDepthwise2d,
+              self).__init__(2,
+                             channels,
+                             kernel_size,
+                             stride,
+                             padding,
+                             dilation,
+                             bias,
+                             True,
+                             indice_key=indice_key,
+                             algo=algo)
+
+
+class SparseConvDepthwise2d(SparseDepthwiseConvolution):
+    """Depthwise SparseConv2d: an output site is active iff its kernel window
+    holds an active input site, so the active set grows."""
+
+    def __init__(self,
+                 channels,
+                 kernel_size,
+                 stride=1,
+                 padding=0,
+                 dilation=1,
+                 bias=True,
+                 indice_key=None,
+                 algo: Optional[ConvAlgo] = None):
+        super(SparseConvDepthwise2d,
+              self).__init__(2,
+                             channels,
+                             kernel_size,
+                             stride,
+                             padding,
+                             dilation,
+                             bias,
+                             indice_key=indice_key,
+                             algo=algo)
