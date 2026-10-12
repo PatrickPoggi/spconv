@@ -2306,13 +2306,22 @@ def global_pool_rearrange(coords: torch.Tensor, batch_size: int):
 
 
 _DEPTHWISE_CPP_DTYPES = {torch.float32: "float", torch.float16: "tv::half_t"}
-_DEPTHWISE_NVRTC_MODULES: Dict[Tuple[torch.dtype, int], "CummNVRTCModule"] = {}
+_DEPTHWISE_NVRTC_MODULES: Dict[Tuple[torch.dtype, int, int],
+                               "CummNVRTCModule"] = {}
 
 
-def _get_depthwise_nvrtc_module(dtype: torch.dtype, vec_len: int):
+def _get_depthwise_nvrtc_module(dtype: torch.dtype, vec_len: int,
+                                device: torch.device):
     """SparseDepthwiseConvKernel for a dtype and a vector length, compiled
-    with nvrtc on first use, as the nvrtc gemm kernels in spconv.algo."""
-    key = (dtype, vec_len)
+    with nvrtc on first use, as the nvrtc gemm kernels in spconv.algo.
+
+    A loaded module belongs to the CUDA context of one device, so there is
+    one per device.
+    """
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    key = (dtype, vec_len, index)
     if key not in _DEPTHWISE_NVRTC_MODULES:
         from cumm.nvrtc import CummNVRTCModule
         from spconv.csrc.sparse.depthwise import SparseDepthwiseConvKernel
@@ -2321,8 +2330,12 @@ def _get_depthwise_nvrtc_module(dtype: torch.dtype, vec_len: int):
         kernel = SparseDepthwiseConvKernel(_DEPTHWISE_CPP_DTYPES[dtype],
                                            vec_len)
         kernel.namespace = "spconv"
-        mod = CummNVRTCModule([kernel])
-        mod.load()
+        with torch.cuda.device(index):
+            # loading needs a current CUDA context; an allocation makes sure
+            # the device has one
+            torch.empty(1, device=f"cuda:{index}")
+            mod = CummNVRTCModule([kernel])
+            mod.load()
         _DEPTHWISE_NVRTC_MODULES[key] = mod
     return _DEPTHWISE_NVRTC_MODULES[key]
 
@@ -2371,7 +2384,8 @@ def indice_depthwise_conv(features: torch.Tensor, filters: torch.Tensor,
         bias = bias.contiguous()
         tensors.append(bias)
     vec_len = _depthwise_vec_len(*tensors)
-    mod = _get_depthwise_nvrtc_module(features.dtype, vec_len)
+    mod = _get_depthwise_nvrtc_module(features.dtype, vec_len,
+                                      features.device)
     num_blocks_x, num_blocks_y, threads_x, threads_y = _depthwise_launch_dims(
         num_activate_out, num_features // vec_len)
     # LaunchUtils kMaxGridYZDim, as IndiceMaxPool::forward_implicit_gemm
@@ -2411,7 +2425,8 @@ def indice_depthwise_conv_backward_filters(features: torch.Tensor,
     if num_indices == 0:
         return dfilters
     vec_len = _depthwise_vec_len(features, out_bp)
-    mod = _get_depthwise_nvrtc_module(features.dtype, vec_len)
+    mod = _get_depthwise_nvrtc_module(features.dtype, vec_len,
+                                      features.device)
     num_blocks_x, _, threads_x, threads_y = _depthwise_launch_dims(
         num_indices, num_features // vec_len)
     # at least 16 rows per thread, in at most 1024 slices of the rows
