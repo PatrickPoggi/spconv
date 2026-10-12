@@ -85,18 +85,22 @@ def _random_input(density: float, size=(16, 16), batch: int = 2):
 
 
 def _assert_close(a: torch.Tensor, b: torch.Tensor):
-    # dense and sparse sum the kernel taps in different orders
-    torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+    # dense and sparse sum the kernel taps in different orders; float16 is
+    # compared with a float32 reference
+    if a.dtype == torch.float16:
+        torch.testing.assert_close(a.float(), b, rtol=1e-2, atol=1e-2)
+    else:
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
 
 
 def _check_against_dense(cls, kernel_size: int, density: float, stride: int = 1,
                          padding=None, dilation: int = 1, bias: bool = True,
-                         algo=None, size=(16, 16)):
+                         algo=None, size=(16, 16), dtype=torch.float32):
     torch.manual_seed(0)
     x, mask = _random_input(density, size)
     conv = _depthwise_conv(kernel_size, stride, padding, dilation, bias)
-    dw = cls.from_conv2d(conv, algo=algo)
-    out = dw(_to_sparse(x, mask))
+    dw = cls.from_conv2d(conv, algo=algo).to(dtype)
+    out = dw(_to_sparse(x.to(dtype), mask))
     _assert_close(out.features, _dense_reference(conv, x, mask, out.indices))
 
 
@@ -258,16 +262,19 @@ def test_every_algo():
 
 
 def test_backward_matches_dense():
-    for cls, stride in [(SubMConvDepthwise2d, 1), (SubMConvDepthwise2d, 2),
-                        (SparseConvDepthwise2d, 2)]:
+    for cls, stride, dtype in [(SubMConvDepthwise2d, 1, torch.float32),
+                               (SubMConvDepthwise2d, 2, torch.float32),
+                               (SparseConvDepthwise2d, 2, torch.float32),
+                               (SubMConvDepthwise2d, 1, torch.float16),
+                               (SubMConvDepthwise2d, 2, torch.float16)]:
         torch.manual_seed(0)
         x, mask = _random_input(0.6)
         conv = _depthwise_conv(3, stride)
-        dw = cls.from_conv2d(conv)
+        dw = cls.from_conv2d(conv).to(dtype)
 
         # make both inputs leaf tensors that record a gradient
         st = _to_sparse(x, mask)
-        features = st.features.clone()
+        features = st.features.clone().to(dtype)
         features.requires_grad = True
         out_tensor = dw(st.replace_feature(features))
         out = out_tensor.features
@@ -387,6 +394,44 @@ def test_in_sparse_sequential():
     dw = SubMConvDepthwise2d(CHANNELS, 3).to(DEVICE)
     st = _to_sparse(x, mask)
     _assert_close(spconv.SparseSequential(dw)(st).features, dw(st).features)
+
+
+def test_half_precision():
+    """float16, with 128-bit loads, against a float32 dense reference."""
+    for algo in [ConvAlgo.Native, ConvAlgo.MaskImplicitGemm]:
+        _check_against_dense(SubMConvDepthwise2d, 3, density=0.6, algo=algo,
+                             dtype=torch.float16)
+        _check_against_dense(SubMConvDepthwise2d, 3, density=0.6, stride=2,
+                             padding=1, algo=algo, dtype=torch.float16)
+        _check_against_dense(SparseConvDepthwise2d, 3, density=0.6, stride=2,
+                             padding=1, algo=algo, dtype=torch.float16)
+    _check_against_dense(SubMConvDepthwise2d, 7, density=0.6,
+                         dtype=torch.float16)
+
+
+def test_unaligned_channels():
+    """6 channels are no multiple of a 128-bit vector: one channel per load."""
+    torch.manual_seed(0)
+    channels = 6
+    x = torch.randn(2, channels, 16, 16, device=DEVICE)
+    mask = torch.rand(2, 16, 16, device=DEVICE) < 0.6
+    for cls, stride in [(SubMConvDepthwise2d, 1), (SubMConvDepthwise2d, 2),
+                        (SparseConvDepthwise2d, 2)]:
+        conv = nn.Conv2d(channels, channels, 3, stride=stride, padding=1,
+                         groups=channels).to(DEVICE)
+        dw = cls.from_conv2d(conv)
+        st = _to_sparse(x, mask)
+        features = st.features.clone()
+        features.requires_grad = True
+        out = dw(st.replace_feature(features))
+        x_ref = x.clone()
+        x_ref.requires_grad = True
+        ref = _dense_reference(conv, x_ref, mask, out.indices)
+        _assert_close(out.features, ref)
+        out.features.sum().backward()
+        ref.sum().backward()
+        _assert_close(dw.weight.grad, conv.weight.grad.permute(0, 2, 3, 1))
+        _assert_close(features.grad, x_ref.grad.permute(0, 2, 3, 1)[mask])
 
 
 def test_subm_strided_against_dense():
@@ -548,6 +593,8 @@ if __name__ == "__main__":
     test_kernel7()
     test_dilation()
     test_every_algo()
+    test_half_precision()
+    test_unaligned_channels()
     test_subm_strided_against_dense()
     test_subm_strided_output_sites()
     test_regular_against_dense()

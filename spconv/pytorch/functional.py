@@ -420,6 +420,55 @@ class SparseAvgPoolImplicitGemmFunction(Function):
         return input_bp, None, None, None, None
 
 
+class SparseDepthwiseConvFunction(Function):
+    @staticmethod
+    @_TORCH_CUSTOM_FWD
+    def forward(ctx, features: torch.Tensor, filters: torch.Tensor,
+                bias: Optional[torch.Tensor], pair_fwd: torch.Tensor,
+                pair_bwd: Optional[torch.Tensor], num_activate_out: int,
+                is_subm: bool):
+        """filters (C, *ksize, 1); pair_fwd (kernel volume, num_activate_out)
+        and pair_bwd (kernel volume, N) in the implicit gemm format.
+        pair_bwd is unused if is_subm: the rulebook of a stride 1 subm conv
+        is symmetric."""
+        # (C, *ksize, 1) -> (kernel volume, C)
+        filters_kc = filters.reshape(filters.shape[0], -1).t()
+        out = ops.indice_depthwise_conv(features, filters_kc, bias, pair_fwd,
+                                        num_activate_out)
+        ctx.save_for_backward(features, filters, pair_fwd, pair_bwd)
+        ctx.has_bias = bias is not None
+        ctx.is_subm = is_subm
+        return out
+
+    @staticmethod
+    @once_differentiable
+    @_TORCH_CUSTOM_BWD
+    def backward(ctx, grad_output):
+        features, filters, pair_fwd, pair_bwd = ctx.saved_tensors
+        input_bp = filters_bp = bias_bp = None
+        filters_kc = filters.reshape(filters.shape[0], -1).t()
+        if ctx.needs_input_grad[0]:
+            if ctx.is_subm:
+                # the bwd pairs of offset k are the fwd pairs of offset
+                # kv - 1 - k, so gather with the offsets of filters reversed
+                input_bp = ops.indice_depthwise_conv(grad_output,
+                                                     filters_kc.flip(0), None,
+                                                     pair_fwd,
+                                                     features.shape[0])
+            else:
+                input_bp = ops.indice_depthwise_conv(grad_output, filters_kc,
+                                                     None, pair_bwd,
+                                                     features.shape[0])
+        if ctx.needs_input_grad[1]:
+            dfilters = ops.indice_depthwise_conv_backward_filters(
+                features, grad_output, pair_fwd)
+            filters_bp = dfilters.t().reshape(filters.shape).to(filters.dtype)
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            bias_bp = grad_output.sum(0, dtype=torch.float32).to(
+                grad_output.dtype)
+        return input_bp, filters_bp, bias_bp, None, None, None, None
+
+
 indice_conv = SparseConvFunction.apply
 implicit_gemm = SparseImplicitGemmFunction.apply
 indice_inverse_conv = SparseInverseConvFunction.apply
@@ -427,6 +476,7 @@ indice_subm_conv = SubMConvFunction.apply
 indice_maxpool = SparseMaxPoolFunction.apply
 indice_maxpool_implicit_gemm = SparseMaxPoolImplicitGemmFunction.apply
 indice_avgpool_implicit_gemm = SparseAvgPoolImplicitGemmFunction.apply
+indice_depthwise_conv = SparseDepthwiseConvFunction.apply
 
 
 def _indice_to_scalar(indices: torch.Tensor, shape: List[int]):

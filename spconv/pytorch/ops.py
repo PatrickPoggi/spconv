@@ -22,7 +22,7 @@ import torch
 import numpy as np
 import spconv
 from spconv.core import AlgoHint, ConvAlgo
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 from spconv.pytorch.core import ThrustSortAllocator
 from spconv.pytorch.cppcore import _TORCH_DTYPE_TO_TV, TorchAllocator, torch_tensor_to_tv, get_current_stream, get_arch, TorchSpconvMatmul
 from spconv.core_cc.csrc.sparse.all import SpconvOps
@@ -224,6 +224,22 @@ def pair_fwd_to_indice_pairs(pair_fwd: torch.Tensor, num_in: int):
     indice_pairs[1].scatter_(1, slot, out_rows)
     indice_pair_num = valid.sum(1).to(pair_fwd.dtype)
     return indice_pairs[:, :, :num_in].contiguous(), indice_pair_num
+
+
+def pair_fwd_to_pair_bwd(pair_fwd: torch.Tensor, num_in: int) -> torch.Tensor:
+    """pair_bwd (kv, num_in) of a regular rulebook: pair_bwd[k, j] is the
+    output row that reads input row j at offset k, or -1."""
+    kv, num_out = pair_fwd.shape
+    valid = pair_fwd != -1
+    # an input row is read at most once per offset; invalid pairs go to an
+    # extra column that is dropped afterwards
+    dst = torch.where(valid, pair_fwd.long(), num_in)
+    out_rows = torch.arange(num_out, dtype=pair_fwd.dtype,
+                            device=pair_fwd.device).expand(kv, num_out)
+    pair_bwd = torch.full((kv, num_in + 1), -1, dtype=pair_fwd.dtype,
+                          device=pair_fwd.device)
+    pair_bwd.scatter_(1, dst, out_rows)
+    return pair_bwd[:, :num_in].contiguous()
 
 
 def _keep_parents(pair_fwd: torch.Tensor, ksize: List[int], stride: List[int],
@@ -2287,3 +2303,126 @@ def global_pool_rearrange(coords: torch.Tensor, batch_size: int):
     SpconvOps.global_pool_rearrange(torch_tensor_to_tv(out_indices), torch_tensor_to_tv(coords),
                                       torch_tensor_to_tv(counts), stream )
     return out_indices, counts
+
+
+_DEPTHWISE_CPP_DTYPES = {torch.float32: "float", torch.float16: "tv::half_t"}
+_DEPTHWISE_NVRTC_MODULES: Dict[Tuple[torch.dtype, int], "CummNVRTCModule"] = {}
+
+
+def _get_depthwise_nvrtc_module(dtype: torch.dtype, vec_len: int):
+    """SparseDepthwiseConvKernel for a dtype and a vector length, compiled
+    with nvrtc on first use, as the nvrtc gemm kernels in spconv.algo."""
+    key = (dtype, vec_len)
+    if key not in _DEPTHWISE_NVRTC_MODULES:
+        from cumm.nvrtc import CummNVRTCModule
+        from spconv.csrc.sparse.depthwise import SparseDepthwiseConvKernel
+        assert dtype in _DEPTHWISE_CPP_DTYPES, \
+            f"depthwise conv supports float32 and float16, got {dtype}"
+        kernel = SparseDepthwiseConvKernel(_DEPTHWISE_CPP_DTYPES[dtype],
+                                           vec_len)
+        kernel.namespace = "spconv"
+        mod = CummNVRTCModule([kernel])
+        mod.load()
+        _DEPTHWISE_NVRTC_MODULES[key] = mod
+    return _DEPTHWISE_NVRTC_MODULES[key]
+
+
+def _depthwise_vec_len(*tensors: torch.Tensor) -> int:
+    """16 bytes (128-bit loads) if every row of every tensor starts 16-byte
+    aligned, otherwise one element."""
+    vec_len = 16 // tensors[0].element_size()
+    for t in tensors:
+        if t.shape[-1] % vec_len != 0 or t.data_ptr() % 16 != 0:
+            return 1
+    return vec_len
+
+
+def _depthwise_launch_dims(num_indices: int, num_vecs: int):
+    """LaunchUtils.get_blocks_threads_of_2d_tensor in channel vectors, with
+    256 threads per block and threadIdx.x no wider than the vectors of a
+    row, so small channel counts leave no thread idle."""
+    threads_x = 1
+    while threads_x < min(num_vecs, 32):
+        threads_x *= 2
+    threads_y = 256 // threads_x
+    return (div_up(num_vecs, threads_x), div_up(num_indices, threads_y),
+            threads_x, threads_y)
+
+
+def indice_depthwise_conv(features: torch.Tensor, filters: torch.Tensor,
+                          bias: Optional[torch.Tensor],
+                          indice_pairs: torch.Tensor, num_activate_out: int):
+    """out[i, c] = bias[c] + sum_k filters[k, c] * features[pair[k, i], c].
+
+    filters is (kernel volume, C), indice_pairs (kernel volume,
+    num_activate_out) in the implicit gemm format, -1 for no input.
+    """
+    features = features.contiguous()
+    filters = filters.contiguous()
+    indice_pairs = indice_pairs.contiguous()
+    num_features = features.shape[1]
+    out_features = torch.empty((num_activate_out, num_features),
+                               dtype=features.dtype,
+                               device=features.device)
+    if num_activate_out == 0:
+        return out_features
+    tensors = [features, filters, out_features]
+    if bias is not None:
+        bias = bias.contiguous()
+        tensors.append(bias)
+    vec_len = _depthwise_vec_len(*tensors)
+    mod = _get_depthwise_nvrtc_module(features.dtype, vec_len)
+    num_blocks_x, num_blocks_y, threads_x, threads_y = _depthwise_launch_dims(
+        num_activate_out, num_features // vec_len)
+    # LaunchUtils kMaxGridYZDim, as IndiceMaxPool::forward_implicit_gemm
+    one_dim = num_blocks_y > 65535
+    if one_dim:
+        blocks = (num_blocks_x * num_blocks_y, 1, 1)
+    else:
+        blocks = (num_blocks_x, num_blocks_y, 1)
+    launch = tv.LaunchParam(blocks, (threads_x, threads_y, 1), 0,
+                            get_current_stream())
+    # without bias, any tensor of the dtype: the kernel does not read it
+    bias_tv = torch_tensor_to_tv(bias if bias is not None else filters)
+    mod.run_kernel("spconv::forward_kernel", launch,
+                   torch_tensor_to_tv(out_features),
+                   torch_tensor_to_tv(features), torch_tensor_to_tv(filters),
+                   bias_tv, torch_tensor_to_tv(indice_pairs),
+                   int(bias is not None), num_activate_out, num_features,
+                   indice_pairs.shape[0], num_blocks_x, num_blocks_y,
+                   int(one_dim))
+    return out_features
+
+
+def indice_depthwise_conv_backward_filters(features: torch.Tensor,
+                                           out_bp: torch.Tensor,
+                                           indice_pairs: torch.Tensor):
+    """dfilters[k, c] = sum_i out_bp[i, c] * features[pair[k, i], c], as
+    (kernel volume, C) in float32."""
+    features = features.contiguous()
+    out_bp = out_bp.contiguous()
+    indice_pairs = indice_pairs.contiguous()
+    num_indices = out_bp.shape[0]
+    num_features = features.shape[1]
+    kv = indice_pairs.shape[0]
+    dfilters = torch.zeros((kv, num_features),
+                           dtype=torch.float32,
+                           device=features.device)
+    if num_indices == 0:
+        return dfilters
+    vec_len = _depthwise_vec_len(features, out_bp)
+    mod = _get_depthwise_nvrtc_module(features.dtype, vec_len)
+    num_blocks_x, _, threads_x, threads_y = _depthwise_launch_dims(
+        num_indices, num_features // vec_len)
+    # at least 16 rows per thread, in at most 1024 slices of the rows
+    num_slices = min(div_up(num_indices, threads_y * 16), 1024)
+    smem = threads_x * threads_y * vec_len * 4
+    launch = tv.LaunchParam((num_slices, kv, num_blocks_x),
+                            (threads_x, threads_y, 1), smem,
+                            get_current_stream())
+    mod.run_kernel("spconv::backward_filter_kernel", launch,
+                   torch_tensor_to_tv(dfilters), torch_tensor_to_tv(out_bp),
+                   torch_tensor_to_tv(features),
+                   torch_tensor_to_tv(indice_pairs), num_indices,
+                   num_features)
+    return dfilters

@@ -27,7 +27,8 @@ sum of ITS OWN CHANNEL across the kernel offsets.
 
 No GEMM is needed. The rulebooks are spconv's own (ops.get_indice_pairs and
 ops.get_indice_pairs_implicit_gemm) and are shared through `indice_key` as for
-the other sparse convolutions.
+the other sparse convolutions. On CUDA the forward and backward run in the
+kernels of spconv/csrc/sparse/depthwise.py, compiled with nvrtc on first use.
 """
 
 import math
@@ -40,6 +41,7 @@ from torch.nn.parameter import Parameter
 
 from spconv.core import ConvAlgo
 from spconv.cppconstants import CPU_ONLY_BUILD
+from spconv.pytorch import functional as Fsp
 from spconv.pytorch import ops
 from spconv.pytorch.conv import SparseConvolutionBase
 from spconv.pytorch.core import (IndiceData, ImplicitGemmIndiceData,
@@ -244,22 +246,60 @@ class SparseDepthwiseConvolution(SparseModule):
             ksize=self.kernel_size, stride=self.stride, padding=self.padding,
             dilation=self.dilation)
 
-    def forward(self, input: SparseConvTensor) -> SparseConvTensor:
-        """(N, C) features in, (num_out, C) out.
+    def _get_pair_bwd(self, datas, pair_fwd: torch.Tensor,
+                      num_in: int) -> torch.Tensor:
+        """pair_bwd (kernel volume, num_in) of a regular or strided rulebook,
+        for the input gradient: the one spconv built, or derived once per
+        rulebook from pair_fwd."""
+        if isinstance(datas, ImplicitGemmIndiceData) and datas.pair_bwd.numel():
+            return datas.pair_bwd
+        pair_bwd = getattr(datas, "_depthwise_pair_bwd", None)
+        if pair_bwd is None:
+            pair_bwd = ops.pair_fwd_to_pair_bwd(pair_fwd, num_in)
+            datas._depthwise_pair_bwd = pair_bwd
+        return pair_bwd
 
-        One gather per kernel offset. Each output row appears at most once per
-        offset, so it accumulates with a plain add: no index_add_, no atomics.
-        """
+    def forward(self, input: SparseConvTensor) -> SparseConvTensor:
+        """(N, C) features in, (num_out, C) out."""
         datas, pair_fwd, indice_dict = self._get_rulebook(input)
-        pair_fwd = pair_fwd.long()  # indexing takes int64: convert once
         features = input.features
+        # a stride 1 subm rulebook is symmetric, so its bwd pairs are its
+        # fwd pairs; the others need pair_bwd for the input gradient
+        is_subm = self.subm and not self.strided_subm
+        if features.is_cuda:
+            pair_bwd = None
+            if (not is_subm and features.requires_grad
+                    and torch.is_grad_enabled()):
+                pair_bwd = self._get_pair_bwd(datas, pair_fwd,
+                                              features.shape[0])
+            output_features = Fsp.indice_depthwise_conv(
+                features, self.weight, self.bias, pair_fwd, pair_bwd,
+                pair_fwd.shape[1], is_subm)
+        else:
+            output_features = self._forward_torch(features, pair_fwd,
+                                                  is_subm)
+
+        # assembled as in SparseConvolution
+        out_tensor = input.shadow_copy()
+        out_tensor = out_tensor.replace_feature(output_features)
+        out_tensor.indices = datas.out_indices
+        out_tensor.indice_dict = indice_dict
+        out_tensor.spatial_shape = datas.out_spatial_shape
+        return out_tensor
+
+    def _forward_torch(self, features: torch.Tensor, pair_fwd: torch.Tensor,
+                       is_subm: bool) -> torch.Tensor:
+        """The forward in PyTorch ops, for CPU tensors: one gather per kernel
+        offset. Each output row appears at most once per offset, so it
+        accumulates with a plain add: no index_add_, no atomics."""
+        pair_fwd = pair_fwd.long()  # indexing takes int64: convert once
         w = self.weight.reshape(self.channels, -1)  # (C, *k, 1) -> (C, kv)
         num_offsets, num_out = pair_fwd.shape
 
         bias = self.bias
         if bias is None:
             bias = features.new_zeros(self.channels)
-        if self.subm and not self.strided_subm:
+        if is_subm:
             # The centre offset maps every row to itself in a stride 1 subm
             # conv, so it needs no gather (spconv's Native forward skips it
             # too). It starts the sum, with the bias folded in.
@@ -278,14 +318,7 @@ class SparseDepthwiseConvolution(SparseModule):
             # multiply and add in one kernel, no temporary for the product
             output_features.addcmul_(padded_input[pair_fwd[offset_index]],
                                      w[:, offset_index])
-
-        # assembled as in SparseConvolution
-        out_tensor = input.shadow_copy()
-        out_tensor = out_tensor.replace_feature(output_features)
-        out_tensor.indices = datas.out_indices
-        out_tensor.indice_dict = indice_dict
-        out_tensor.spatial_shape = datas.out_spatial_shape
-        return out_tensor
+        return output_features
 
     @torch.no_grad()
     def load_from_conv2d(self,
