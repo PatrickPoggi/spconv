@@ -26,6 +26,7 @@ from torch import nn
 
 import spconv.pytorch as spconv
 from spconv.core import ConvAlgo
+from spconv.pytorch import ops
 from spconv.pytorch.depthwise import SparseConvDepthwise2d, SubMConvDepthwise2d
 
 # we must disable tf32 to increase reference precision.
@@ -102,6 +103,29 @@ def _check_against_dense(cls, kernel_size: int, density: float, stride: int = 1,
     dw = cls.from_conv2d(conv, algo=algo).to(dtype)
     out = dw(_to_sparse(x.to(dtype), mask))
     _assert_close(out.features, _dense_reference(conv, x, mask, out.indices))
+
+
+def _check_inference_against_dense(cls, kernel_size: int, stride: int = 1,
+                                   padding=None, dilation: int = 1,
+                                   bias: bool = True, act_type: str = "none",
+                                   dtype=torch.float32, size=(16, 16),
+                                   density: float = 0.6):
+    """Without gradients a 2D layer runs the tile kernel, with the bias and
+    the activation fused; the reference applies the activation to the dense
+    result."""
+    torch.manual_seed(0)
+    x, mask = _random_input(density, size)
+    conv = _depthwise_conv(kernel_size, stride, padding, dilation, bias)
+    dw = cls.from_conv2d(conv, act_type=act_type).to(dtype)
+    st = _to_sparse(x.to(dtype), mask)
+    tile_shape = ops.depthwise_tile_shape(st.features, dw.kernel_size,
+                                          dw.stride, dw.dilation,
+                                          mask.numel())
+    assert tile_shape is not None, "the tile kernel should run here"
+    with torch.no_grad():
+        out = dw(st)
+        ref = dw._apply_act(_dense_reference(conv, x, mask, out.indices))
+    _assert_close(out.features, ref)
 
 
 def _sites(indices: torch.Tensor) -> set:
@@ -432,6 +456,131 @@ def test_unaligned_channels():
         ref.sum().backward()
         _assert_close(dw.weight.grad, conv.weight.grad.permute(0, 2, 3, 1))
         _assert_close(features.grad, x_ref.grad.permute(0, 2, 3, 1)[mask])
+        # without gradients too: no tile kernel for 6 channels, the rulebook
+        # kernels run
+        with torch.no_grad():
+            out = dw(st)
+            ref = _dense_reference(conv, x, mask, out.indices)
+        _assert_close(out.features, ref)
+
+
+def test_inference_against_dense():
+    for dtype in [torch.float32, torch.float16]:
+        for cls, stride in [(SubMConvDepthwise2d, 1), (SubMConvDepthwise2d, 2),
+                            (SparseConvDepthwise2d, 1),
+                            (SparseConvDepthwise2d, 2)]:
+            for kernel_size in [3, 7]:
+                _check_inference_against_dense(cls, kernel_size, stride,
+                                               dtype=dtype)
+        # odd grids: partial tiles, and with padding 0 a last row and column
+        # that no output reads
+        _check_inference_against_dense(SubMConvDepthwise2d, 3, 1, dtype=dtype,
+                                       size=(15, 13))
+        _check_inference_against_dense(SubMConvDepthwise2d, 3, 2, padding=0,
+                                       dtype=dtype, size=(15, 15))
+        _check_inference_against_dense(SubMConvDepthwise2d, 3, 1, dilation=2,
+                                       dtype=dtype)
+        _check_inference_against_dense(SubMConvDepthwise2d, 3, 1, bias=False,
+                                       dtype=dtype)
+        # mostly empty tiles, which the kernel skips
+        _check_inference_against_dense(SubMConvDepthwise2d, 3, 1, dtype=dtype,
+                                       size=(48, 48), density=0.02)
+        for act_type in ["relu", "sigmoid", "leaky_relu", "silu"]:
+            _check_inference_against_dense(SubMConvDepthwise2d, 3, 1,
+                                           act_type=act_type, dtype=dtype)
+
+
+def test_tile_shapes_against_dense():
+    """Every tile shape the tile kernel can pick, on a grid no tile divides,
+    with 80 channels: two blocks of 32 channels and a partial one."""
+    channels = 80
+    for dtype in [torch.float32, torch.float16]:
+        for stride in [1, 2]:
+            strided = stride > 1
+            # every shape of either dtype, and the fallbacks
+            tile_shapes = sorted(set(
+                ops._DEPTHWISE_TILE_SHAPES[(2, strided)] +
+                ops._DEPTHWISE_TILE_SHAPES[(4, strided)] +
+                ops._DEPTHWISE_TILE_FALLBACKS[strided]))
+            for kernel_size in [3, 7]:
+                torch.manual_seed(0)
+                x = torch.randn(2, channels, 19, 21, device=DEVICE)
+                mask = torch.rand(2, 19, 21, device=DEVICE) < 0.6
+                conv = nn.Conv2d(channels, channels, kernel_size,
+                                 stride=stride, padding=kernel_size // 2,
+                                 groups=channels).to(DEVICE)
+                dw = SubMConvDepthwise2d.from_conv2d(conv).to(dtype)
+                st = _to_sparse(x.to(dtype), mask)
+                in_grid = ops.depthwise_index_grid(st.indices, 2,
+                                                   st.spatial_shape)
+                if dw.strided_subm:
+                    datas, _ = dw._get_indice_data(st)
+                    out_indices = datas.out_indices
+                    out_grid = ops.depthwise_index_grid(
+                        out_indices, 2, datas.out_spatial_shape)
+                else:
+                    out_indices, out_grid = st.indices, in_grid
+                ref = _dense_reference(conv, x, mask, out_indices)
+                for tile_shape in tile_shapes:
+                    if ops._depthwise_tile_smem(
+                            st.features.element_size(), dw.kernel_size,
+                            dw.stride, dw.dilation,
+                            tile_shape[0]) > ops._DEPTHWISE_TILE_SMEM:
+                        continue
+                    out = ops.indice_depthwise_conv_tile(
+                        st.features, dw._tile_weights(), in_grid, out_grid,
+                        out_indices.shape[0], dw.kernel_size, dw.stride,
+                        dw.padding, dw.dilation, tile_shape)
+                    _assert_close(out, ref)
+
+
+def test_inference_matches_rulebook_path():
+    """The tile kernel (no gradients) and the rulebook kernels (gradients)
+    compute the same layer, activation included."""
+    for cls, stride in [(SubMConvDepthwise2d, 1), (SubMConvDepthwise2d, 2),
+                        (SparseConvDepthwise2d, 2)]:
+        torch.manual_seed(0)
+        x, mask = _random_input(0.6)
+        dw = cls(CHANNELS, 3, stride, 1, act_type="silu").to(DEVICE)
+        st = _to_sparse(x, mask)
+        with torch.no_grad():
+            out_tile = dw(st)
+        out_rulebook = dw(st)
+        _assert_close_by_site(out_tile, out_rulebook)
+
+
+def test_inference_follows_weight_changes():
+    """The tile kernel keeps the reshaped filters between calls: a change of
+    the weight in place, as load_state_dict makes, must reach the output."""
+    torch.manual_seed(0)
+    x, mask = _random_input(0.6)
+    conv = _depthwise_conv(3)
+    dw = SubMConvDepthwise2d.from_conv2d(conv)
+    st = _to_sparse(x, mask)
+    with torch.no_grad():
+        dw(st)
+        conv.weight.mul_(2)
+        dw.load_state_dict(SubMConvDepthwise2d.from_conv2d(conv).state_dict())
+        out = dw(st)
+        ref = _dense_reference(conv, x, mask, out.indices)
+    _assert_close(out.features, ref)
+
+
+def test_kernels_reject_mismatched_dtypes():
+    """The kernels get raw pointers: other dtypes than the features' fail."""
+    torch.manual_seed(0)
+    x, mask = _random_input(0.6)
+    dw = SubMConvDepthwise2d(CHANNELS, 3).to(DEVICE)
+    st = _to_sparse(x.half(), mask)
+    _, pair_fwd, _ = dw._get_rulebook(st)
+    filters = dw.weight.reshape(CHANNELS, -1).t()  # float32
+    try:
+        ops.indice_depthwise_conv(st.features, filters, None, pair_fwd,
+                                  pair_fwd.shape[1])
+        raise AssertionError("float32 filters accepted for float16 features")
+    except AssertionError as e:
+        if "differs" not in str(e):
+            raise
 
 
 def test_subm_strided_against_dense():
@@ -595,6 +744,11 @@ if __name__ == "__main__":
     test_every_algo()
     test_half_precision()
     test_unaligned_channels()
+    test_inference_against_dense()
+    test_tile_shapes_against_dense()
+    test_inference_matches_rulebook_path()
+    test_inference_follows_weight_changes()
+    test_kernels_reject_mismatched_dtypes()
     test_subm_strided_against_dense()
     test_subm_strided_output_sites()
     test_regular_against_dense()

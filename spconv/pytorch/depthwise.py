@@ -36,6 +36,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.nn import init
 from torch.nn.parameter import Parameter
 
@@ -78,6 +79,14 @@ class SparseDepthwiseConvolution(SparseModule):
             default of a SparseConvolution with the same kernel size, so the
             key can be shared with it. The forward pass is the same for every
             algo.
+        act_type: activation after the bias, fused into the inference kernel
+            as SparseConvolution's act_type: "none", "relu", "sigmoid",
+            "leaky_relu" (slope act_alpha) or "silu".
+
+    Inference: without gradients (torch.no_grad or inference_mode), a 2D layer
+    on CUDA runs the tile kernel (ops.indice_depthwise_conv_tile), with the
+    bias and the activation fused, and a stride 1 subm layer needs no
+    rulebook. Otherwise the forward and backward run on the rulebook.
 
     Weight layout:
         `weight` is (C, *kernel_size, 1). This is spconv's KRSC layout
@@ -101,7 +110,9 @@ class SparseDepthwiseConvolution(SparseModule):
                  bias: bool = True,
                  subm: bool = False,
                  indice_key: Optional[str] = None,
-                 algo: Optional[ConvAlgo] = None):
+                 algo: Optional[ConvAlgo] = None,
+                 act_type: str = "none",
+                 act_alpha: float = 0.01):
         super().__init__()
         self.ndim = ndim
         self.channels = channels
@@ -133,6 +144,10 @@ class SparseDepthwiseConvolution(SparseModule):
         if self.strided_subm:
             ops.check_strided_subm(self.kernel_size, self.stride,
                                    self.padding, self.dilation, algo)
+        if act_type not in ("none", "relu", "sigmoid", "leaky_relu", "silu"):
+            raise ValueError(f"unknown act_type {act_type}")
+        self.act_type = act_type
+        self.act_alpha = act_alpha
 
         self.weight = Parameter(torch.zeros(self.channels, *self.kernel_size, 1))
         if bias:
@@ -140,6 +155,7 @@ class SparseDepthwiseConvolution(SparseModule):
         else:
             self.register_parameter('bias', None)
         self.reset_parameters()
+        self._tile_weights_cache = None
 
     def reset_parameters(self):
         # kaiming_uniform_ with a=sqrt(5), as SparseConvolution uses, reduces
@@ -166,20 +182,15 @@ class SparseDepthwiseConvolution(SparseModule):
         if self.indice_key is not None:
             s += ', indice_key={indice_key}'
         s += f', algo={self.algo}'
+        if self.act_type != "none":
+            s += ', act_type={act_type}'
         return s.format(**self.__dict__)
 
-    def _get_rulebook(self, input: SparseConvTensor):
-        """The rulebook for this input, cached or freshly built.
-
-        Returns (datas, pair_fwd, indice_dict). datas is spconv's IndiceData
-        or ImplicitGemmIndiceData, with the output indices and spatial shape.
-        pair_fwd is (kernel volume, num_out): pair_fwd[k, i] is the input row
-        that output row i reads at offset k, or -1 if that site is inactive.
-        This is the implicit gemm format; a Native rulebook is converted to
-        it. indice_dict is for the output tensor: as in SparseConvolution, a
-        new rulebook goes into a copy of the input's dict, and the input is
-        left unchanged.
-        """
+    def _get_indice_data(self, input: SparseConvTensor):
+        """(datas, indice_dict): spconv's IndiceData or ImplicitGemmIndiceData
+        of this input, cached or freshly built, and the dict for the output
+        tensor. As in SparseConvolution, a new rulebook goes into a copy of the
+        input's dict, and the input is left unchanged."""
         indice_dict = input.indice_dict.copy()
         datas = input.find_indice_pair(self.indice_key)
         if datas is not None:
@@ -192,7 +203,19 @@ class SparseDepthwiseConvolution(SparseModule):
             datas = self._build_rulebook(input)
             if self.indice_key is not None:
                 indice_dict[self.indice_key] = datas
+        return datas, indice_dict
 
+    def _get_rulebook(self, input: SparseConvTensor):
+        """The rulebook for this input, cached or freshly built.
+
+        Returns (datas, pair_fwd, indice_dict). datas is spconv's IndiceData
+        or ImplicitGemmIndiceData, with the output indices and spatial shape.
+        pair_fwd is (kernel volume, num_out): pair_fwd[k, i] is the input row
+        that output row i reads at offset k, or -1 if that site is inactive.
+        This is the implicit gemm format; a Native rulebook is converted to
+        it. indice_dict is for the output tensor (_get_indice_data).
+        """
+        datas, indice_dict = self._get_indice_data(input)
         if isinstance(datas, ImplicitGemmIndiceData):
             return datas, datas.pair_fwd, indice_dict
         # convert once per rulebook, not once per layer sharing it
@@ -261,8 +284,16 @@ class SparseDepthwiseConvolution(SparseModule):
 
     def forward(self, input: SparseConvTensor) -> SparseConvTensor:
         """(N, C) features in, (num_out, C) out."""
-        datas, pair_fwd, indice_dict = self._get_rulebook(input)
         features = input.features
+        needs_grad = torch.is_grad_enabled() and (
+            features.requires_grad or self.weight.requires_grad
+            or (self.bias is not None and self.bias.requires_grad))
+        if not needs_grad:
+            tile_shape = self._tile_shape(input)
+            if tile_shape is not None:
+                return self._forward_tile(input, tile_shape)
+
+        datas, pair_fwd, indice_dict = self._get_rulebook(input)
         # a stride 1 subm rulebook is symmetric, so its bwd pairs are its
         # fwd pairs; the others need pair_bwd for the input gradient
         is_subm = self.subm and not self.strided_subm
@@ -278,14 +309,94 @@ class SparseDepthwiseConvolution(SparseModule):
         else:
             output_features = self._forward_torch(features, pair_fwd,
                                                   is_subm)
+        output_features = self._apply_act(output_features)
+        return self._output_tensor(input, output_features, datas.out_indices,
+                                   datas.out_spatial_shape, indice_dict)
 
-        # assembled as in SparseConvolution
-        out_tensor = input.shadow_copy()
-        out_tensor = out_tensor.replace_feature(output_features)
-        out_tensor.indices = datas.out_indices
+    def _tile_shape(self, input: SparseConvTensor):
+        """ops.depthwise_tile_shape for this input, None for the rulebook
+        kernels."""
+        grid_sites = input.batch_size
+        for size in input.spatial_shape:
+            grid_sites *= size
+        if self.subm and not self.strided_subm:
+            out_spatial_shape = input.spatial_shape
+        else:
+            out_spatial_shape = ops.get_conv_output_size(
+                input.spatial_shape, self.kernel_size, self.stride,
+                self.padding, self.dilation)
+        return ops.depthwise_tile_shape(input.features, self.kernel_size,
+                                        self.stride, self.dilation,
+                                        grid_sites, out_spatial_shape)
+
+    def _forward_tile(self, input: SparseConvTensor,
+                      tile_shape) -> SparseConvTensor:
+        """Inference forward by the tile kernel, with the bias and the
+        activation fused."""
+        features = input.features
+        if self.subm and not self.strided_subm:
+            # the output sites are the input sites: no rulebook needed
+            out_indices = input.indices
+            out_spatial_shape = input.spatial_shape
+            indice_dict = input.indice_dict
+        else:
+            datas, indice_dict = self._get_indice_data(input)
+            out_indices = datas.out_indices
+            out_spatial_shape = datas.out_spatial_shape
+        in_grid = ops.depthwise_index_grid(input.indices, input.batch_size,
+                                           input.spatial_shape)
+        out_grid = in_grid
+        if out_indices is not input.indices:
+            out_grid = ops.depthwise_index_grid(out_indices, input.batch_size,
+                                                out_spatial_shape)
+        output_features = ops.indice_depthwise_conv_tile(
+            features, self._tile_weights(), in_grid, out_grid,
+            out_indices.shape[0], self.kernel_size, self.stride, self.padding,
+            self.dilation, tile_shape, self.act_type, self.act_alpha)
+        return self._output_tensor(input, output_features, out_indices,
+                                   out_spatial_shape, indice_dict)
+
+    def _tile_weights(self) -> torch.Tensor:
+        """ops.depthwise_tile_weights of the weight and the bias, kept while
+        both are unchanged, so inference does not rebuild them per call. A new
+        value or device of either rebuilds them."""
+        # each parameter read once: nn.Module looks parameters up in Python
+        weight, bias = self.weight, self.bias
+        key = (weight._version, weight.data_ptr())
+        if bias is not None:
+            key += (bias._version, bias.data_ptr())
+        # getattr: a layer pickled before the cache existed has none
+        cache = getattr(self, "_tile_weights_cache", None)
+        if cache is None or cache[0] != key:
+            filters = weight.detach().reshape(self.channels, -1).t()
+            if bias is not None:
+                bias = bias.detach()
+            cache = (key, ops.depthwise_tile_weights(filters, bias))
+            self._tile_weights_cache = cache
+        return cache[1]
+
+    def _output_tensor(self, input: SparseConvTensor,
+                       features: torch.Tensor, indices: torch.Tensor,
+                       spatial_shape, indice_dict) -> SparseConvTensor:
+        # as SparseConvolution's shadow_copy + replace_feature: replace_feature
+        # copies the same members, in one new tensor instead of two
+        out_tensor = input.replace_feature(features)
+        out_tensor.indices = indices
         out_tensor.indice_dict = indice_dict
-        out_tensor.spatial_shape = datas.out_spatial_shape
+        out_tensor.spatial_shape = spatial_shape
         return out_tensor
+
+    def _apply_act(self, features: torch.Tensor) -> torch.Tensor:
+        """The activation, in PyTorch ops, where it is not fused."""
+        if self.act_type == "relu":
+            return F.relu(features)
+        if self.act_type == "sigmoid":
+            return torch.sigmoid(features)
+        if self.act_type == "leaky_relu":
+            return F.leaky_relu(features, self.act_alpha)
+        if self.act_type == "silu":
+            return F.silu(features)
+        return features
 
     def _forward_torch(self, features: torch.Tensor, pair_fwd: torch.Tensor,
                        is_subm: bool) -> torch.Tensor:
@@ -358,12 +469,13 @@ class SparseDepthwiseConvolution(SparseModule):
     def from_conv2d(cls,
                     conv: nn.Conv2d,
                     indice_key: Optional[str] = None,
-                    algo: Optional[ConvAlgo] = None
-                    ) -> "SparseDepthwiseConvolution":
+                    algo: Optional[ConvAlgo] = None,
+                    act_type: str = "none",
+                    act_alpha: float = 0.01) -> "SparseDepthwiseConvolution":
         """Build from a depthwise `nn.Conv2d`, on its device and dtype.
 
-        `indice_key` and `algo` have no dense counterpart, so they are passed
-        separately.
+        `indice_key`, `algo` and the activation have no counterpart in the
+        conv, so they are passed separately.
         """
         mod = cls(conv.in_channels,
                   kernel_size=list(conv.kernel_size),
@@ -372,7 +484,9 @@ class SparseDepthwiseConvolution(SparseModule):
                   dilation=list(conv.dilation),
                   bias=conv.bias is not None,
                   indice_key=indice_key,
-                  algo=algo)
+                  algo=algo,
+                  act_type=act_type,
+                  act_alpha=act_alpha)
         mod = mod.to(device=conv.weight.device, dtype=conv.weight.dtype)
         return mod.load_from_conv2d(conv)
 
@@ -389,7 +503,9 @@ class SubMConvDepthwise2d(SparseDepthwiseConvolution):
                  dilation=1,
                  bias=True,
                  indice_key=None,
-                 algo: Optional[ConvAlgo] = None):
+                 algo: Optional[ConvAlgo] = None,
+                 act_type: str = "none",
+                 act_alpha: float = 0.01):
         super(SubMConvDepthwise2d,
               self).__init__(2,
                              channels,
@@ -400,7 +516,9 @@ class SubMConvDepthwise2d(SparseDepthwiseConvolution):
                              bias,
                              True,
                              indice_key=indice_key,
-                             algo=algo)
+                             algo=algo,
+                             act_type=act_type,
+                             act_alpha=act_alpha)
 
 
 class SparseConvDepthwise2d(SparseDepthwiseConvolution):
@@ -415,7 +533,9 @@ class SparseConvDepthwise2d(SparseDepthwiseConvolution):
                  dilation=1,
                  bias=True,
                  indice_key=None,
-                 algo: Optional[ConvAlgo] = None):
+                 algo: Optional[ConvAlgo] = None,
+                 act_type: str = "none",
+                 act_alpha: float = 0.01):
         super(SparseConvDepthwise2d,
               self).__init__(2,
                              channels,
@@ -425,4 +545,6 @@ class SparseConvDepthwise2d(SparseDepthwiseConvolution):
                              dilation,
                              bias,
                              indice_key=indice_key,
-                             algo=algo)
+                             algo=algo,
+                             act_type=act_type,
+                             act_alpha=act_alpha)

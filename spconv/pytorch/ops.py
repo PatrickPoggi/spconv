@@ -2306,29 +2306,67 @@ def global_pool_rearrange(coords: torch.Tensor, batch_size: int):
 
 
 _DEPTHWISE_CPP_DTYPES = {torch.float32: "float", torch.float16: "tv::half_t"}
-_DEPTHWISE_NVRTC_MODULES: Dict[Tuple[torch.dtype, int, int],
-                               "CummNVRTCModule"] = {}
+# cumm NVRTCModule::ArgType::kArray (tensorview/cuda/nvrtc.h): the argument
+# is the bytes of a CPU tensor
+_NVRTC_ARG_ARRAY = 1
+_CUDA_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
-def _get_depthwise_nvrtc_module(dtype: torch.dtype, vec_len: int,
-                                device: torch.device):
-    """SparseDepthwiseConvKernel for a dtype and a vector length, compiled
-    with nvrtc on first use, as the nvrtc gemm kernels in spconv.algo.
+def _depthwise_stream(device_index: int) -> int:
+    """The current stream of a device, as get_current_stream(), without
+    building a torch.cuda.Stream: that takes several us of a launch."""
+    if _CUDA_RAW_STREAM is not None:
+        return _CUDA_RAW_STREAM(device_index)
+    return torch.cuda.current_stream(device_index).cuda_stream
+
+
+class _DepthwiseNVRTCKernels:
+    """A module compiled with nvrtc whose kernels take one argument, an
+    array of int64 with the pointers and the sizes. A launch builds the array
+    and calls NVRTCModule.run_kernel directly, which saves the conversions of
+    run_kernel's arguments one by one."""
+
+    def __init__(self, mod):
+        self.mod = mod
+        self.cpp_mod = mod.get_cpp_object()
+        self.lowered_names: Dict[str, str] = {}
+
+    def lowered_name(self, name: str) -> str:
+        lowered = self.lowered_names.get(name)
+        if lowered is None:
+            lowered = self.mod.get_lowered_name(f"spconv::{name}")
+            self.lowered_names[name] = lowered
+        return lowered
+
+    def launch(self, name: str, blocks, threads, smem: int, args: List[int],
+               stream: int):
+        # from_numpy borrows the memory of `values`, which must stay alive
+        # until run_kernel has copied it into the launch
+        values = np.array(args, dtype=np.int64)
+        self.cpp_mod.run_kernel(self.lowered_name(name), blocks, threads, smem,
+                                stream,
+                                [(tv.from_numpy(values), _NVRTC_ARG_ARRAY, 0,
+                                  0)])
+
+    def attributes(self, name: str) -> Dict[str, int]:
+        """registers, shared and local memory of a kernel (cuFuncGetAttribute)"""
+        return self.cpp_mod.get_kernel_attributes(self.lowered_name(name))
+
+
+_DEPTHWISE_NVRTC_MODULES: Dict[tuple, _DepthwiseNVRTCKernels] = {}
+
+
+def _get_depthwise_nvrtc_module(key: tuple, make_kernel, index: int):
+    """The kernel class make_kernel() returns, compiled with nvrtc on first
+    use of `key`, as the nvrtc gemm kernels in spconv.algo.
 
     A loaded module belongs to the CUDA context of one device, so there is
-    one per device.
+    one per device index.
     """
-    index = device.index
-    if index is None:
-        index = torch.cuda.current_device()
-    key = (dtype, vec_len, index)
+    key = key + (index, )
     if key not in _DEPTHWISE_NVRTC_MODULES:
         from cumm.nvrtc import CummNVRTCModule
-        from spconv.csrc.sparse.depthwise import SparseDepthwiseConvKernel
-        assert dtype in _DEPTHWISE_CPP_DTYPES, \
-            f"depthwise conv supports float32 and float16, got {dtype}"
-        kernel = SparseDepthwiseConvKernel(_DEPTHWISE_CPP_DTYPES[dtype],
-                                           vec_len)
+        kernel = make_kernel()
         kernel.namespace = "spconv"
         with torch.cuda.device(index):
             # loading needs a current CUDA context; an allocation makes sure
@@ -2336,8 +2374,40 @@ def _get_depthwise_nvrtc_module(dtype: torch.dtype, vec_len: int,
             torch.empty(1, device=f"cuda:{index}")
             mod = CummNVRTCModule([kernel])
             mod.load()
-        _DEPTHWISE_NVRTC_MODULES[key] = mod
+        _DEPTHWISE_NVRTC_MODULES[key] = _DepthwiseNVRTCKernels(mod)
     return _DEPTHWISE_NVRTC_MODULES[key]
+
+
+def _depthwise_cpp_dtype(dtype: torch.dtype) -> str:
+    assert dtype in _DEPTHWISE_CPP_DTYPES, \
+        f"depthwise conv supports float32 and float16, got {dtype}"
+    return _DEPTHWISE_CPP_DTYPES[dtype]
+
+
+def _get_depthwise_gather_module(dtype: torch.dtype, vec_len: int,
+                                 device_index: int):
+    def make_kernel():
+        from spconv.csrc.sparse.depthwise import SparseDepthwiseConvKernel
+        return SparseDepthwiseConvKernel(_depthwise_cpp_dtype(dtype), vec_len)
+
+    return _get_depthwise_nvrtc_module(("gather", dtype, vec_len),
+                                       make_kernel, device_index)
+
+
+def _check_depthwise_args(features: torch.Tensor,
+                          same_dtype: List[Optional[torch.Tensor]],
+                          int32: List[torch.Tensor]):
+    """The kernels get raw pointers, so the types they assume are checked
+    here: a mismatch must fail, not read the wrong bytes."""
+    device_index = features.get_device()
+    assert device_index >= 0, "the depthwise conv kernels need CUDA tensors"
+    for ten in same_dtype:
+        if ten is not None:
+            assert ten.dtype == features.dtype, \
+                f"dtype {ten.dtype} differs from the features' {features.dtype}"
+            assert ten.get_device() == device_index
+    for ten in int32:
+        assert ten.dtype == torch.int32 and ten.get_device() == device_index
 
 
 def _depthwise_vec_len(*tensors: torch.Tensor) -> int:
@@ -2370,6 +2440,7 @@ def indice_depthwise_conv(features: torch.Tensor, filters: torch.Tensor,
     filters is (kernel volume, C), indice_pairs (kernel volume,
     num_activate_out) in the implicit gemm format, -1 for no input.
     """
+    _check_depthwise_args(features, [filters, bias], [indice_pairs])
     features = features.contiguous()
     filters = filters.contiguous()
     indice_pairs = indice_pairs.contiguous()
@@ -2384,8 +2455,8 @@ def indice_depthwise_conv(features: torch.Tensor, filters: torch.Tensor,
         bias = bias.contiguous()
         tensors.append(bias)
     vec_len = _depthwise_vec_len(*tensors)
-    mod = _get_depthwise_nvrtc_module(features.dtype, vec_len,
-                                      features.device)
+    device_index = features.get_device()
+    mod = _get_depthwise_gather_module(features.dtype, vec_len, device_index)
     num_blocks_x, num_blocks_y, threads_x, threads_y = _depthwise_launch_dims(
         num_activate_out, num_features // vec_len)
     # LaunchUtils kMaxGridYZDim, as IndiceMaxPool::forward_implicit_gemm
@@ -2394,17 +2465,16 @@ def indice_depthwise_conv(features: torch.Tensor, filters: torch.Tensor,
         blocks = (num_blocks_x * num_blocks_y, 1, 1)
     else:
         blocks = (num_blocks_x, num_blocks_y, 1)
-    launch = tv.LaunchParam(blocks, (threads_x, threads_y, 1), 0,
-                            get_current_stream())
-    # without bias, any tensor of the dtype: the kernel does not read it
-    bias_tv = torch_tensor_to_tv(bias if bias is not None else filters)
-    mod.run_kernel("spconv::forward_kernel", launch,
-                   torch_tensor_to_tv(out_features),
-                   torch_tensor_to_tv(features), torch_tensor_to_tv(filters),
-                   bias_tv, torch_tensor_to_tv(indice_pairs),
-                   int(bias is not None), num_activate_out, num_features,
-                   indice_pairs.shape[0], num_blocks_x, num_blocks_y,
-                   int(one_dim))
+    mod.launch("forward_kernel", blocks, (threads_x, threads_y, 1), 0, [
+        out_features.data_ptr(),
+        features.data_ptr(),
+        filters.data_ptr(),
+        bias.data_ptr() if bias is not None else 0,
+        indice_pairs.data_ptr(),
+        int(bias is not None), num_activate_out, num_features,
+        indice_pairs.shape[0], num_blocks_x, num_blocks_y,
+        int(one_dim)
+    ], _depthwise_stream(device_index))
     return out_features
 
 
@@ -2413,6 +2483,7 @@ def indice_depthwise_conv_backward_filters(features: torch.Tensor,
                                            indice_pairs: torch.Tensor):
     """dfilters[k, c] = sum_i out_bp[i, c] * features[pair[k, i], c], as
     (kernel volume, C) in float32."""
+    _check_depthwise_args(features, [out_bp], [indice_pairs])
     features = features.contiguous()
     out_bp = out_bp.contiguous()
     indice_pairs = indice_pairs.contiguous()
@@ -2425,19 +2496,232 @@ def indice_depthwise_conv_backward_filters(features: torch.Tensor,
     if num_indices == 0:
         return dfilters
     vec_len = _depthwise_vec_len(features, out_bp)
-    mod = _get_depthwise_nvrtc_module(features.dtype, vec_len,
-                                      features.device)
+    device_index = features.get_device()
+    mod = _get_depthwise_gather_module(features.dtype, vec_len, device_index)
     num_blocks_x, _, threads_x, threads_y = _depthwise_launch_dims(
         num_indices, num_features // vec_len)
     # at least 16 rows per thread, in at most 1024 slices of the rows
     num_slices = min(div_up(num_indices, threads_y * 16), 1024)
     smem = threads_x * threads_y * vec_len * 4
-    launch = tv.LaunchParam((num_slices, kv, num_blocks_x),
-                            (threads_x, threads_y, 1), smem,
-                            get_current_stream())
-    mod.run_kernel("spconv::backward_filter_kernel", launch,
-                   torch_tensor_to_tv(dfilters), torch_tensor_to_tv(out_bp),
-                   torch_tensor_to_tv(features),
-                   torch_tensor_to_tv(indice_pairs), num_indices,
-                   num_features)
+    mod.launch("backward_filter_kernel", (num_slices, kv, num_blocks_x),
+               (threads_x, threads_y, 1), smem, [
+                   dfilters.data_ptr(),
+                   out_bp.data_ptr(),
+                   features.data_ptr(),
+                   indice_pairs.data_ptr(), num_indices, num_features
+               ], _depthwise_stream(device_index))
     return dfilters
+
+
+# the tile kernel: shared memory is static, at most 48 KB a block (with room
+# for the alignment of its arrays); 32 channels a block, 4 a thread
+_DEPTHWISE_TILE_SMEM = 48 * 1024 - 256
+_DEPTHWISE_TILE_CHANNELS = 32
+_DEPTHWISE_TILE_THREADS_PER_SITE = 8
+# (output tile, outputs per thread) by element size and stride > 1, by
+# preference: the fastest in a sweep on a T4 over channel counts, grid sizes,
+# kernel sizes and densities (float32 input tiles take twice the shared
+# memory of float16 ones)
+_DEPTHWISE_TILE_SHAPES = {
+    (2, False): [((8, 16), 8), ((8, 8), 4)],
+    (4, False): [((8, 8), 4)],
+    (2, True): [((4, 8), 2)],
+    (4, True): [((4, 8), 2)],
+}
+# smaller ones, for kernels whose input tile does not fit the shared memory
+_DEPTHWISE_TILE_FALLBACKS = {
+    False: [((4, 8), 4), ((4, 4), 4)],
+    True: [((4, 4), 2), ((2, 4), 2)],
+}
+
+
+def _depthwise_tile_smem(element_size: int, ksize: List[int],
+                         stride: List[int], dilation: List[int],
+                         tile: Tuple[int, int]) -> int:
+    """the static shared memory of SparseDepthwiseConvTileKernel"""
+    region_h = (tile[0] - 1) * stride[0] + (ksize[0] - 1) * dilation[0] + 1
+    region_w = (tile[1] - 1) * stride[1] + (ksize[1] - 1) * dilation[1] + 1
+    row = div_up(region_w, stride[1]) * stride[1]
+    channels = _DEPTHWISE_TILE_CHANNELS
+    return (region_h * row * channels * element_size +
+            (ksize[0] * ksize[1] + 1) * channels * 4 + tile[0] * tile[1] * 4)
+
+
+def depthwise_tile_shape(features: torch.Tensor,
+                         ksize: List[int],
+                         stride: List[int],
+                         dilation: List[int],
+                         grid_sites: int,
+                         out_spatial_shape: Optional[List[int]] = None):
+    """(output tile, outputs per thread) of the tile kernel for a 2D layer,
+    or None where it does not apply, and the rulebook kernels run: not CUDA,
+    not 2D, features without aligned 128-bit loads (dtype, channel count,
+    layout), an index grid of more than 2^27 sites, or a kernel too large
+    for the shared memory.
+
+    Of the preferred tiles that fit, the first that covers out_spatial_shape
+    with at most 30% of it outside, else the one with the least outside: a
+    wide tile on a narrow grid leaves threads idle.
+    """
+    if (not features.is_cuda or len(ksize) != 2
+            or features.dtype not in _DEPTHWISE_CPP_DTYPES
+            or grid_sites > 2**27):
+        return None
+    element_size = features.element_size()
+    if (features.shape[1] % (16 // element_size) != 0
+            or not features.is_contiguous() or features.data_ptr() % 16 != 0):
+        return None
+    if out_spatial_shape is not None:
+        out_spatial_shape = tuple(out_spatial_shape)
+    return _depthwise_tile_choice(element_size, tuple(ksize), tuple(stride),
+                                  tuple(dilation), out_spatial_shape)
+
+
+@functools.lru_cache(maxsize=None)
+def _depthwise_tile_choice(element_size: int, ksize: Tuple[int, int],
+                           stride: Tuple[int, int], dilation: Tuple[int, int],
+                           out_spatial_shape: Optional[Tuple[int, int]]):
+    strided = any(s != 1 for s in stride)
+
+    def fits(shape):
+        return _depthwise_tile_smem(element_size, ksize, stride, dilation,
+                                    shape[0]) <= _DEPTHWISE_TILE_SMEM
+
+    shapes = [s for s in _DEPTHWISE_TILE_SHAPES[(element_size, strided)]
+              if fits(s)]
+    if not shapes:
+        shapes = [s for s in _DEPTHWISE_TILE_FALLBACKS[strided] if fits(s)]
+        return shapes[0] if shapes else None
+    if out_spatial_shape is None:
+        return shapes[0]
+
+    def covered(shape):
+        tile = shape[0]
+        return (div_up(out_spatial_shape[0], tile[0]) * tile[0] *
+                div_up(out_spatial_shape[1], tile[1]) * tile[1])
+
+    sites = out_spatial_shape[0] * out_spatial_shape[1]
+    for shape in shapes:
+        if covered(shape) <= 1.3 * sites:
+            return shape
+    return min(shapes, key=covered)
+
+
+def depthwise_tile_weights(filters: torch.Tensor,
+                           bias: Optional[torch.Tensor]) -> torch.Tensor:
+    """float32 (kernel volume + 1, C), as the tile kernel reads them: the
+    filters (kernel volume, C), then the bias, zeros without one."""
+    kv, channels = filters.shape
+    weights = torch.zeros((kv + 1, channels),
+                          dtype=torch.float32,
+                          device=filters.device)
+    weights[:kv] = filters
+    if bias is not None:
+        weights[kv] = bias
+    return weights
+
+
+def depthwise_index_grid(indices: torch.Tensor, batch_size: int,
+                         spatial_shape: List[int]) -> torch.Tensor:
+    """(batch_size, *spatial_shape) int32: the row of each site of `indices`,
+    -1 where inactive. Cached on the indices tensor, which the subm layers of
+    one active set share."""
+    shape = (batch_size, *spatial_shape)
+    grid = getattr(indices, "_depthwise_index_grid", None)
+    if grid is None or tuple(grid.shape) != shape:
+        grid = torch.full(shape, -1, dtype=torch.int32, device=indices.device)
+        sites = indices.long().t()
+        grid[tuple(sites)] = torch.arange(indices.shape[0],
+                                          dtype=torch.int32,
+                                          device=indices.device)
+        indices._depthwise_index_grid = grid
+    return grid
+
+
+def _get_depthwise_tile_module(dtype: torch.dtype, ksize: List[int],
+                               stride: List[int], dilation: List[int],
+                               tile_shape, act_type: str, device_index: int):
+    tile, outputs_per_thread = tile_shape
+
+    def make_kernel():
+        from spconv.csrc.sparse.depthwise import SparseDepthwiseConvTileKernel
+        return SparseDepthwiseConvTileKernel(_depthwise_cpp_dtype(dtype),
+                                             ksize, stride, dilation, tile,
+                                             outputs_per_thread, act_type)
+
+    key = ("tile", dtype, tuple(ksize), tuple(stride), tuple(dilation),
+           tuple(tile), outputs_per_thread, act_type)
+    return _get_depthwise_nvrtc_module(key, make_kernel, device_index)
+
+
+@functools.lru_cache(maxsize=None)
+def _float_bits(value: float) -> int:
+    return int(np.array(value, dtype=np.float32).view(np.int32))
+
+
+def indice_depthwise_conv_tile(features: torch.Tensor,
+                               weights: torch.Tensor,
+                               in_grid: torch.Tensor,
+                               out_grid: torch.Tensor,
+                               num_activate_out: int,
+                               ksize: List[int],
+                               stride: List[int],
+                               padding: List[int],
+                               dilation: List[int],
+                               tile_shape,
+                               act_type: str = "none",
+                               act_alpha: float = 0.0):
+    """out[o, c] = act(bias[c] + sum_k filters[k, c] * features[i(o, k), c])
+    for the active output sites o of out_grid, written to their rows. i(o, k)
+    is the input site o * stride - padding + offset(k) * dilation, read
+    through in_grid, zero where inactive. weights is depthwise_tile_weights
+    of the filters and the bias, tile_shape depthwise_tile_shape.
+    """
+    # the kernel reads raw pointers, with 128-bit loads: the types, devices
+    # and alignment it assumes are checked here (device indices, as
+    # torch.device objects cost more than the rest of the launch)
+    device_index = features.get_device()
+    num_features = features.shape[1]
+    assert device_index >= 0 and features.dtype in _DEPTHWISE_CPP_DTYPES
+    assert (weights.dtype == torch.float32 and in_grid.dtype == torch.int32
+            and out_grid.dtype == torch.int32)
+    assert (weights.get_device() == device_index
+            and in_grid.get_device() == device_index
+            and out_grid.get_device() == device_index)
+    assert (weights.shape[0] == ksize[0] * ksize[1] + 1
+            and weights.shape[1] == num_features)
+    assert (features.is_contiguous() and weights.is_contiguous()
+            and in_grid.is_contiguous() and out_grid.is_contiguous()
+            and features.data_ptr() % 16 == 0 and weights.data_ptr() % 16 == 0
+            and num_features % (16 // features.element_size()) == 0)
+    if num_activate_out == features.shape[0]:
+        # the output sites are often the input sites; empty_like is the
+        # cheapest allocation
+        out_features = torch.empty_like(features)
+    else:
+        out_features = features.new_empty((num_activate_out, num_features))
+    if num_activate_out == 0:
+        return out_features
+    mod = _get_depthwise_tile_module(features.dtype, ksize, stride, dilation,
+                                     tile_shape, act_type, device_index)
+    tile, outputs_per_thread = tile_shape
+    batch_size, in_h, in_w = in_grid.shape
+    _, out_h, out_w = out_grid.shape
+    num_cb = div_up(num_features, _DEPTHWISE_TILE_CHANNELS)
+    num_tiles_x = div_up(out_w, tile[1])
+    num_tiles_y = div_up(out_h, tile[0])
+    threads = ((tile[0] // outputs_per_thread) * tile[1] *
+               _DEPTHWISE_TILE_THREADS_PER_SITE)
+    mod.launch("tile_forward_kernel",
+               (num_cb * num_tiles_x * num_tiles_y * batch_size, 1, 1),
+               (threads, 1, 1), 0, [
+                   out_features.data_ptr(),
+                   features.data_ptr(),
+                   weights.data_ptr(),
+                   in_grid.data_ptr(),
+                   out_grid.data_ptr(), num_features, in_h, in_w, out_h,
+                   out_w, padding[0], padding[1], num_cb, num_tiles_x,
+                   num_tiles_y,
+                   _float_bits(float(act_alpha))
+               ], _depthwise_stream(device_index))
+    return out_features
