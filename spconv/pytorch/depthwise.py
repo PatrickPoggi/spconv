@@ -36,6 +36,7 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
+from cumm import tensorview as tv
 from torch import nn
 from torch.nn import functional as F
 from torch.nn import init
@@ -49,6 +50,27 @@ from spconv.pytorch.conv import SparseConvolutionBase
 from spconv.pytorch.core import (IndiceData, ImplicitGemmIndiceData,
                                  SparseConvTensor, expand_nd)
 from spconv.pytorch.modules import SparseModule
+
+_ACT_NAMES = ("none", "relu", "sigmoid", "leaky_relu", "silu")
+_CUMM_ACT_NAMES = {
+    tv.gemm.Activation.None_: "none",
+    tv.gemm.Activation.ReLU: "relu",
+    tv.gemm.Activation.Sigmoid: "sigmoid",
+    tv.gemm.Activation.LeakyReLU: "leaky_relu",
+}
+# cumm versions that have it
+if hasattr(tv.gemm.Activation, "SiLU"):
+    _CUMM_ACT_NAMES[tv.gemm.Activation.SiLU] = "silu"
+
+
+def _act_name(act_type) -> str:
+    """The name of an act_type: a name, or the tv.gemm.Activation that
+    SparseConvolution takes."""
+    name = act_type if isinstance(act_type, str) else \
+        _CUMM_ACT_NAMES.get(act_type)
+    if name not in _ACT_NAMES:
+        raise ValueError(f"unknown act_type {act_type}")
+    return name
 
 
 class SparseDepthwiseConvolution(SparseModule):
@@ -82,7 +104,8 @@ class SparseDepthwiseConvolution(SparseModule):
             algo.
         act_type: activation after the bias, fused into the inference kernels
             as SparseConvolution's act_type: "none", "relu", "sigmoid",
-            "leaky_relu" (slope act_alpha) or "silu".
+            "leaky_relu" (slope act_alpha) or "silu", or the same
+            tv.gemm.Activation that SparseConvolution takes.
 
     Inference: without gradients (torch.no_grad or inference_mode), a 2D layer
     on CUDA runs the tile kernel (ops.indice_depthwise_conv_tile), with the
@@ -113,7 +136,7 @@ class SparseDepthwiseConvolution(SparseModule):
                  subm: bool = False,
                  indice_key: Optional[str] = None,
                  algo: Optional[ConvAlgo] = None,
-                 act_type: str = "none",
+                 act_type: Union[str, tv.gemm.Activation] = "none",
                  act_alpha: float = 0.01):
         super().__init__()
         self.ndim = ndim
@@ -151,9 +174,7 @@ class SparseDepthwiseConvolution(SparseModule):
         if self.strided_subm:
             ops.check_strided_subm(self.kernel_size, self.stride,
                                    self.padding, self.dilation, algo)
-        if act_type not in ("none", "relu", "sigmoid", "leaky_relu", "silu"):
-            raise ValueError(f"unknown act_type {act_type}")
-        self.act_type = act_type
+        self.act_type = _act_name(act_type)
         self.act_alpha = act_alpha
 
         self.weight = Parameter(torch.zeros(self.channels, *self.kernel_size, 1))
@@ -318,7 +339,7 @@ class SparseDepthwiseConvolution(SparseModule):
             filters = self.weight.reshape(self.channels, -1).t()
             output_features = ops.indice_depthwise_conv(
                 features, filters, self.bias, pair_fwd, pair_fwd.shape[1],
-                self.act_type, self.act_alpha)
+                _act_name(self.act_type), self.act_alpha)
         else:
             if features.is_cuda:
                 pair_bwd = None
@@ -375,7 +396,8 @@ class SparseDepthwiseConvolution(SparseModule):
         output_features = ops.indice_depthwise_conv_tile(
             features, self._tile_weights(), in_grid, out_grid,
             out_indices.shape[0], self.kernel_size, self.stride, self.padding,
-            self.dilation, tile_shape, self.act_type, self.act_alpha)
+            self.dilation, tile_shape, _act_name(self.act_type),
+            self.act_alpha)
         return self._output_tensor(input, output_features, out_indices,
                                    out_spatial_shape, indice_dict)
 
@@ -411,13 +433,14 @@ class SparseDepthwiseConvolution(SparseModule):
 
     def _apply_act(self, features: torch.Tensor) -> torch.Tensor:
         """The activation, in PyTorch ops, where it is not fused."""
-        if self.act_type == "relu":
+        act_type = _act_name(self.act_type)
+        if act_type == "relu":
             return F.relu(features)
-        if self.act_type == "sigmoid":
+        if act_type == "sigmoid":
             return torch.sigmoid(features)
-        if self.act_type == "leaky_relu":
+        if act_type == "leaky_relu":
             return F.leaky_relu(features, self.act_alpha)
-        if self.act_type == "silu":
+        if act_type == "silu":
             return F.silu(features)
         return features
 
@@ -493,7 +516,7 @@ class SparseDepthwiseConvolution(SparseModule):
                     conv: nn.Conv2d,
                     indice_key: Optional[str] = None,
                     algo: Optional[ConvAlgo] = None,
-                    act_type: str = "none",
+                    act_type: Union[str, tv.gemm.Activation] = "none",
                     act_alpha: float = 0.01) -> "SparseDepthwiseConvolution":
         """Build from a depthwise `nn.Conv2d`, on its device and dtype.
 
@@ -527,7 +550,7 @@ class SubMConvDepthwise2d(SparseDepthwiseConvolution):
                  bias=True,
                  indice_key=None,
                  algo: Optional[ConvAlgo] = None,
-                 act_type: str = "none",
+                 act_type: Union[str, tv.gemm.Activation] = "none",
                  act_alpha: float = 0.01):
         super(SubMConvDepthwise2d,
               self).__init__(2,
@@ -557,7 +580,7 @@ class SparseConvDepthwise2d(SparseDepthwiseConvolution):
                  bias=True,
                  indice_key=None,
                  algo: Optional[ConvAlgo] = None,
-                 act_type: str = "none",
+                 act_type: Union[str, tv.gemm.Activation] = "none",
                  act_alpha: float = 0.01):
         super(SparseConvDepthwise2d,
               self).__init__(2,

@@ -24,6 +24,7 @@ are compared only at the sparse output sites.
 import warnings
 
 import torch
+from cumm import tensorview as tv
 from torch import nn
 
 import spconv.pytorch as spconv
@@ -614,6 +615,33 @@ def test_rulebook_inference_fuses_act():
                 ref = dw._apply_act(_dense_reference(conv, x, mask,
                                                      out.indices))
             _assert_close(out.features, ref)
+
+
+def test_act_type_takes_cumm_activations():
+    """act_type also takes the tv.gemm.Activation that SparseConvolution
+    takes, at construction or set later, as a fusion pass sets it."""
+    acts = [(tv.gemm.Activation.None_, "none"),
+            (tv.gemm.Activation.ReLU, "relu"),
+            (tv.gemm.Activation.Sigmoid, "sigmoid"),
+            (tv.gemm.Activation.LeakyReLU, "leaky_relu")]
+    if hasattr(tv.gemm.Activation, "SiLU"):
+        acts.append((tv.gemm.Activation.SiLU, "silu"))
+    for act, name in acts:
+        assert SubMConvDepthwise2d(CHANNELS, 3, act_type=act).act_type == name
+    try:
+        SubMConvDepthwise2d(CHANNELS, 3, act_type="gelu")
+        raise AssertionError("accepted act_type gelu")
+    except ValueError:
+        pass
+    torch.manual_seed(0)
+    x, mask = _random_input(0.6)
+    st = _to_sparse(x, mask)
+    dw = SubMConvDepthwise2d(CHANNELS, 3, act_type="sigmoid").to(DEVICE)
+    with torch.no_grad():
+        ref = dw(st)
+        dw.act_type = tv.gemm.Activation.Sigmoid
+        out = dw(st)
+    _assert_close(out.features, ref.features)
 
 
 def test_conv_attributes():
