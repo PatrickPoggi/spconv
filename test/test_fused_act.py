@@ -33,7 +33,8 @@ ALGOS = [ConvAlgo.Native, ConvAlgo.MaskImplicitGemm]
 ALPHA = 0.1
 ACTS = [(tv.gemm.Activation.ReLU, F.relu),
         (tv.gemm.Activation.Sigmoid, torch.sigmoid),
-        (tv.gemm.Activation.LeakyReLU, lambda x: F.leaky_relu(x, ALPHA))]
+        (tv.gemm.Activation.LeakyReLU, lambda x: F.leaky_relu(x, ALPHA)),
+        (tv.gemm.Activation.SiLU, F.silu)]
 TOLERANCE = {torch.float32: 1e-4, torch.float16: 1e-2}
 
 
@@ -62,11 +63,15 @@ def _conv_types(ndim: int, algo, dtype, in_channels: int,
     down = conv(in_channels, in_channels, 3, 2, 1, indice_key="down")
     inverse = conv(in_channels, out_channels, 3, indice_key="down",
                    inverse=True)
+    subm1x1 = conv(in_channels, out_channels, 1, subm=True)
+    regular1x1 = conv(in_channels, out_channels, 1)
     return {
         "subm": (subm, subm),
         "regular": (regular, regular),
         "transposed": (transposed, transposed),
         "inverse": (inverse, lambda x: inverse(down(x))),
+        "subm 1x1": (subm1x1, subm1x1),
+        "regular 1x1": (regular1x1, regular1x1),
     }
 
 
@@ -75,7 +80,7 @@ def _conv_types(ndim: int, algo, dtype, in_channels: int,
 @pytest.mark.parametrize("ndim", [2, 3])
 def test_fused_act(ndim, algo, dtype):
     """Native fuses the activation in its bias kernel, MaskImplicitGemm in the
-    gemm epilogue."""
+    gemm epilogue; a 1x1 conv applies it after the matrix multiply."""
     torch.manual_seed(0)
     x = _random_tensor(ndim, 16, dtype)
     tolerance = TOLERANCE[dtype]

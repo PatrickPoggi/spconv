@@ -94,6 +94,11 @@ class InferenceOpsKernel(pccm.ParameterizedClass):
                         o = T(1) / (T(1) + *reinterpret_cast<T*>( &e ));
                         break;
                     }}
+                    case tv::gemm::Activation::kSiLU:{{
+                        auto e = MathOp::exp(MathOp::neg(*o_nv));
+                        o = o / (T(1) + *reinterpret_cast<T*>( &e ));
+                        break;
+                    }}
                     default: ;
                 }}
                 out_ptr[j] = o;
@@ -136,6 +141,11 @@ class InferenceOpsKernel(pccm.ParameterizedClass):
                 case tv::gemm::Activation::kSigmoid:{{
                     auto e = MathOp::exp(MathOp::neg(*o_nv));
                     out_features[i] = T(1) / (T(1) + *reinterpret_cast<T*>( &e ));
+                    break;
+                }}
+                case tv::gemm::Activation::kSiLU:{{
+                    auto e = MathOp::exp(MathOp::neg(*o_nv));
+                    out_features[i] = o / (T(1) + *reinterpret_cast<T*>( &e ));
                     break;
                 }}
                 default: ;

@@ -54,6 +54,8 @@ def _apply_act(x: torch.Tensor, act_type: tv.gemm.Activation, act_alpha: float,
         return F.sigmoid(x)
     elif act_type == tv.gemm.Activation.LeakyReLU:
         return F.leaky_relu(x, act_alpha)
+    elif act_type == tv.gemm.Activation.SiLU:
+        return F.silu(x)
     else:
         raise NotImplementedError
 
@@ -142,8 +144,6 @@ class SparseConvolutionBase:
         self.act_beta = act_beta
         self.scale = 1.0
         self.zero_point = 0
-        if self.conv1x1:
-            assert act_type == tv.gemm.Activation.None_, "conv1x1 don't support fused act"
 
     def is_inverseable(self):
         return self.indice_key is not None and not self.subm
@@ -231,10 +231,11 @@ class SparseConvolutionBase:
             else:
                 weight_mat = weight.view(self.out_channels,
                                          self.in_channels).T
-            features = torch.mm(input.features, weight_mat)
-
             if bias is not None:
-                features += bias
+                features = torch.addmm(bias, input.features, weight_mat)
+            else:
+                features = torch.mm(input.features, weight_mat)
+            features = _apply_act(features, act_type, act_alpha, act_beta)
             out_tensor = out_tensor.replace_feature(features)
             # padding may change spatial shape of conv 1x1.
             out_tensor.spatial_shape = out_spatial_shape
