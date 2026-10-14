@@ -224,14 +224,14 @@ class SparseConvolutionBase:
                 }
         if self.conv1x1 and not is_int8:
             # in int8 test mode, we don't implement conv1x1 via mm.
-            if FILTER_HWIO:
-                features = torch.mm(
-                    input.features,
-                    weight.view(self.out_channels, self.in_channels).T)
+            # the weight layout of __init__: only RSCK puts in before out
+            if (self.algo == ConvAlgo.Native and not ALL_WEIGHT_IS_KRSC
+                    and FILTER_HWIO):
+                weight_mat = weight.view(self.in_channels, self.out_channels)
             else:
-                features = torch.mm(
-                    input.features,
-                    weight.view(self.in_channels, self.out_channels))
+                weight_mat = weight.view(self.out_channels,
+                                         self.in_channels).T
+            features = torch.mm(input.features, weight_mat)
 
             if bias is not None:
                 features += bias
