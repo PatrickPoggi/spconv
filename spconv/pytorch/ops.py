@@ -2555,9 +2555,10 @@ def depthwise_tile_shape(features: torch.Tensor,
                          out_spatial_shape: Optional[List[int]] = None):
     """(output tile, outputs per thread) of the tile kernel for a 2D layer,
     or None where it does not apply, and the rulebook kernels run: not CUDA,
-    not 2D, features without aligned 128-bit loads (dtype, channel count,
-    layout), an index grid of more than 2^27 sites, or a kernel too large
-    for the shared memory.
+    not 2D, a dtype other than float16 and float32, a channel count that is
+    no multiple of 128 bits (8 float16, 4 float32), an index grid of more
+    than 2^27 sites, or a kernel too large for the shared memory. The layout
+    of the features does not matter (indice_depthwise_conv_tile).
 
     Of the preferred tiles that fit, the first that covers out_spatial_shape
     with at most 30% of it outside, else the one with the least outside: a
@@ -2568,8 +2569,7 @@ def depthwise_tile_shape(features: torch.Tensor,
             or grid_sites > 2**27):
         return None
     element_size = features.element_size()
-    if (features.shape[1] % (16 // element_size) != 0
-            or not features.is_contiguous() or features.data_ptr() % 16 != 0):
+    if features.shape[1] % (16 // element_size) != 0:
         return None
     if out_spatial_shape is not None:
         out_spatial_shape = tuple(out_spatial_shape)
@@ -2676,6 +2676,10 @@ def indice_depthwise_conv_tile(features: torch.Tensor,
     is the input site o * stride - padding + offset(k) * dilation, read
     through in_grid, zero where inactive. weights is depthwise_tile_weights
     of the filters and the bias, tile_shape depthwise_tile_shape.
+
+    The rows of features may be apart by more than the channel count, as in
+    a view of some channels of a wider tensor: they are read in place. Other
+    layouts are copied first.
     """
     # the kernel reads raw pointers, with 128-bit loads: the types, devices
     # and alignment it assumes are checked here (device indices, as
@@ -2690,11 +2694,16 @@ def indice_depthwise_conv_tile(features: torch.Tensor,
             and out_grid.get_device() == device_index)
     assert (weights.shape[0] == ksize[0] * ksize[1] + 1
             and weights.shape[1] == num_features)
-    assert (features.is_contiguous() and weights.is_contiguous()
-            and in_grid.is_contiguous() and out_grid.is_contiguous()
-            and features.data_ptr() % 16 == 0 and weights.data_ptr() % 16 == 0
-            and num_features % (16 // features.element_size()) == 0)
-    if num_activate_out == features.shape[0]:
+    vec_len = 16 // features.element_size()
+    assert (weights.is_contiguous() and in_grid.is_contiguous()
+            and out_grid.is_contiguous() and weights.data_ptr() % 16 == 0
+            and num_features % vec_len == 0)
+    # 128-bit loads need channels next to each other and every row 16-byte
+    # aligned, whatever the distance between rows
+    if (features.stride(1) != 1 or features.stride(0) % vec_len != 0
+            or features.data_ptr() % 16 != 0):
+        features = features.clone(memory_format=torch.contiguous_format)
+    if num_activate_out == features.shape[0] and features.is_contiguous():
         # the output sites are often the input sites; empty_like is the
         # cheapest allocation
         out_features = torch.empty_like(features)
@@ -2722,6 +2731,7 @@ def indice_depthwise_conv_tile(features: torch.Tensor,
                    out_grid.data_ptr(), num_features, in_h, in_w, out_h,
                    out_w, padding[0], padding[1], num_cb, num_tiles_x,
                    num_tiles_y,
-                   _float_bits(float(act_alpha))
+                   _float_bits(float(act_alpha)),
+                   features.stride(0)
                ], _depthwise_stream(device_index))
     return out_features

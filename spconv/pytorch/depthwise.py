@@ -32,6 +32,7 @@ kernels of spconv/csrc/sparse/depthwise.py, compiled with nvrtc on first use.
 """
 
 import math
+import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -116,6 +117,11 @@ class SparseDepthwiseConvolution(SparseModule):
         super().__init__()
         self.ndim = ndim
         self.channels = channels
+        # as SparseConvolution and nn.Conv2d have them, for tools that read
+        # them: a depthwise conv is a grouped conv with one group per channel
+        self.in_channels = channels
+        self.out_channels = channels
+        self.groups = channels
         self.kernel_size = expand_nd(ndim, kernel_size)
         self.stride = expand_nd(ndim, stride)
         self.padding = expand_nd(ndim, padding)
@@ -292,6 +298,15 @@ class SparseDepthwiseConvolution(SparseModule):
             tile_shape = self._tile_shape(input)
             if tile_shape is not None:
                 return self._forward_tile(input, tile_shape)
+            if features.is_cuda and self.ndim == 2:
+                warnings.warn(
+                    f"{type(self).__name__}: no tile kernel for "
+                    f"{features.dtype} features with {features.shape[1]} "
+                    f"channels and kernel size {self.kernel_size}, so "
+                    "inference runs the slower rulebook kernels. The tile "
+                    "kernel needs float16 features with a multiple of 8 "
+                    "channels (float32: 4), a grid of at most 2^27 sites and "
+                    "an input tile that fits in 48 KB of shared memory.")
 
         datas, pair_fwd, indice_dict = self._get_rulebook(input)
         # a stride 1 subm rulebook is symmetric, so its bwd pairs are its

@@ -21,6 +21,8 @@ zero. So the dense reference zeroes the inactive sites of its input, and the two
 are compared only at the sparse output sites.
 """
 
+import warnings
+
 import torch
 from torch import nn
 
@@ -549,6 +551,58 @@ def test_inference_matches_rulebook_path():
         _assert_close_by_site(out_tile, out_rulebook)
 
 
+def test_inference_reads_channel_views():
+    """A view of some channels of a wider tensor, as a channel split makes,
+    runs the tile kernel in place; one off the 16-byte alignment is copied
+    first. Neither falls back to the rulebook kernels."""
+    for dtype, (start, stop) in [(torch.float32, (16, 32)),
+                                 (torch.float16, (16, 32)),
+                                 (torch.float16, (4, 20))]:
+        torch.manual_seed(0)
+        x, mask = _random_input(0.6)
+        conv = _depthwise_conv(3)
+        dw = SubMConvDepthwise2d.from_conv2d(conv).to(dtype)
+        _forbid_build(dw)
+        st = _to_sparse(x.to(dtype), mask)
+        wide = torch.randn(st.features.shape[0], 48, device=DEVICE).to(dtype)
+        wide[:, start:stop] = st.features
+        with torch.no_grad():
+            out = dw(st.replace_feature(wide[:, start:stop]))
+        _assert_close(out.features,
+                      _dense_reference(conv, x, mask, out.indices))
+
+
+def test_inference_warns_without_tile_kernel():
+    """Inference that cannot run the tile kernel says so; training does not,
+    as it always runs the rulebook kernels."""
+    torch.manual_seed(0)
+    channels = 6
+    x = torch.randn(2, channels, 16, 16, device=DEVICE)
+    mask = torch.rand(2, 16, 16, device=DEVICE) < 0.6
+    conv = nn.Conv2d(channels, channels, 3, padding=1,
+                     groups=channels).to(DEVICE)
+    dw = SubMConvDepthwise2d.from_conv2d(conv)
+    st = _to_sparse(x, mask)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with torch.no_grad():
+            dw(st)
+    assert any("no tile kernel" in str(w.message) for w in caught)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dw(st)
+    assert not any("no tile kernel" in str(w.message) for w in caught)
+
+
+def test_conv_attributes():
+    """in_channels, out_channels and groups, as SparseConvolution and
+    nn.Conv2d have them."""
+    dw = SubMConvDepthwise2d(CHANNELS, 3)
+    conv = _depthwise_conv(3)
+    assert (dw.in_channels, dw.out_channels, dw.groups) == \
+        (conv.in_channels, conv.out_channels, conv.groups)
+
+
 def test_inference_follows_weight_changes():
     """The tile kernel keeps the reshaped filters between calls: a change of
     the weight in place, as load_state_dict makes, must reach the output."""
@@ -747,6 +801,9 @@ if __name__ == "__main__":
     test_inference_against_dense()
     test_tile_shapes_against_dense()
     test_inference_matches_rulebook_path()
+    test_inference_reads_channel_views()
+    test_inference_warns_without_tile_kernel()
+    test_conv_attributes()
     test_inference_follows_weight_changes()
     test_kernels_reject_mismatched_dtypes()
     test_subm_strided_against_dense()

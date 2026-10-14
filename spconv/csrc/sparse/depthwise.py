@@ -250,8 +250,10 @@ class SparseDepthwiseConvTileKernel(pccm.Class):
         # the filters and then the bias, 3 in_grid [batch, in_h, in_w],
         # 4 out_grid [batch, out_h, out_w], 5 num_features, 6 in_h, 7 in_w,
         # 8 out_h, 9 out_w, 10 pad_h, 11 pad_w, 12 channel blocks,
-        # 13 tiles along x, 14 tiles along y, 15 act_alpha as float bits
-        code.arg("args", "tv::array<int64_t, 16>")
+        # 13 tiles along x, 14 tiles along y, 15 act_alpha as float bits,
+        # 16 elements from one row of in_features to the next (a view of some
+        # channels of a wider tensor has more than num_features)
+        code.arg("args", "tv::array<int64_t, 17>")
 
         T = self.dtype
         code.raw(f"""
@@ -300,6 +302,7 @@ class SparseDepthwiseConvTileKernel(pccm.Class):
         int num_cb = int(args[12]);
         int num_tiles_x = int(args[13]), num_tiles_y = int(args[14]);
         float act_alpha = __int_as_float(int(args[15]));
+        int64_t in_row_stride = args[16];
 
         // the channel blocks of a tile are neighbours, so they read the rows
         // of the same sites together
@@ -370,7 +373,7 @@ class SparseDepthwiseConvTileKernel(pccm.Class):
                 }}
                 if (rows[i] >= 0 && c < num_features){{
                     vals[i] = *reinterpret_cast<const ChunkT*>(
-                        in_features + int64_t(rows[i]) * num_features + c);
+                        in_features + int64_t(rows[i]) * in_row_stride + c);
                 }}
             }}
             TV_PRAGMA_UNROLL
