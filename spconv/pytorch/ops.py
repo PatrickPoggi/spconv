@@ -2385,12 +2385,13 @@ def _depthwise_cpp_dtype(dtype: torch.dtype) -> str:
 
 
 def _get_depthwise_gather_module(dtype: torch.dtype, vec_len: int,
-                                 device_index: int):
+                                 device_index: int, act_type: str = "none"):
     def make_kernel():
         from spconv.csrc.sparse.depthwise import SparseDepthwiseConvKernel
-        return SparseDepthwiseConvKernel(_depthwise_cpp_dtype(dtype), vec_len)
+        return SparseDepthwiseConvKernel(_depthwise_cpp_dtype(dtype), vec_len,
+                                         act_type)
 
-    return _get_depthwise_nvrtc_module(("gather", dtype, vec_len),
+    return _get_depthwise_nvrtc_module(("gather", dtype, vec_len, act_type),
                                        make_kernel, device_index)
 
 
@@ -2434,8 +2435,11 @@ def _depthwise_launch_dims(num_indices: int, num_vecs: int):
 
 def indice_depthwise_conv(features: torch.Tensor, filters: torch.Tensor,
                           bias: Optional[torch.Tensor],
-                          indice_pairs: torch.Tensor, num_activate_out: int):
-    """out[i, c] = bias[c] + sum_k filters[k, c] * features[pair[k, i], c].
+                          indice_pairs: torch.Tensor, num_activate_out: int,
+                          act_type: str = "none", act_alpha: float = 0.0):
+    """out[i, c] = bias[c] + sum_k filters[k, c] * features[pair[k, i], c],
+    then the activation act_type: "none", "relu", "sigmoid", "leaky_relu"
+    (slope act_alpha) or "silu".
 
     filters is (kernel volume, C), indice_pairs (kernel volume,
     num_activate_out) in the implicit gemm format, -1 for no input.
@@ -2456,7 +2460,8 @@ def indice_depthwise_conv(features: torch.Tensor, filters: torch.Tensor,
         tensors.append(bias)
     vec_len = _depthwise_vec_len(*tensors)
     device_index = features.get_device()
-    mod = _get_depthwise_gather_module(features.dtype, vec_len, device_index)
+    mod = _get_depthwise_gather_module(features.dtype, vec_len, device_index,
+                                       act_type)
     num_blocks_x, num_blocks_y, threads_x, threads_y = _depthwise_launch_dims(
         num_activate_out, num_features // vec_len)
     # LaunchUtils kMaxGridYZDim, as IndiceMaxPool::forward_implicit_gemm
@@ -2473,7 +2478,8 @@ def indice_depthwise_conv(features: torch.Tensor, filters: torch.Tensor,
         indice_pairs.data_ptr(),
         int(bias is not None), num_activate_out, num_features,
         indice_pairs.shape[0], num_blocks_x, num_blocks_y,
-        int(one_dim)
+        int(one_dim),
+        _float_bits(float(act_alpha))
     ], _depthwise_stream(device_index))
     return out_features
 

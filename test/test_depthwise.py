@@ -594,6 +594,28 @@ def test_inference_warns_without_tile_kernel():
     assert not any("no tile kernel" in str(w.message) for w in caught)
 
 
+def test_rulebook_inference_fuses_act():
+    """Without a tile kernel (6 channels here), inference runs the rulebook
+    kernel with the bias and the activation fused."""
+    torch.manual_seed(0)
+    channels = 6
+    x = torch.randn(2, channels, 16, 16, device=DEVICE)
+    mask = torch.rand(2, 16, 16, device=DEVICE) < 0.6
+    st = _to_sparse(x, mask)
+    for cls, stride in [(SubMConvDepthwise2d, 1), (SubMConvDepthwise2d, 2),
+                        (SparseConvDepthwise2d, 2)]:
+        conv = nn.Conv2d(channels, channels, 3, stride=stride, padding=1,
+                         groups=channels).to(DEVICE)
+        for act_type in ["relu", "sigmoid", "leaky_relu", "silu"]:
+            dw = cls.from_conv2d(conv, act_type=act_type, act_alpha=0.1)
+            with warnings.catch_warnings(), torch.no_grad():
+                warnings.simplefilter("ignore")
+                out = dw(st)
+                ref = dw._apply_act(_dense_reference(conv, x, mask,
+                                                     out.indices))
+            _assert_close(out.features, ref)
+
+
 def test_conv_attributes():
     """in_channels, out_channels and groups, as SparseConvolution and
     nn.Conv2d have them."""

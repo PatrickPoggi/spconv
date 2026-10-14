@@ -80,14 +80,15 @@ class SparseDepthwiseConvolution(SparseModule):
             default of a SparseConvolution with the same kernel size, so the
             key can be shared with it. The forward pass is the same for every
             algo.
-        act_type: activation after the bias, fused into the inference kernel
+        act_type: activation after the bias, fused into the inference kernels
             as SparseConvolution's act_type: "none", "relu", "sigmoid",
             "leaky_relu" (slope act_alpha) or "silu".
 
     Inference: without gradients (torch.no_grad or inference_mode), a 2D layer
     on CUDA runs the tile kernel (ops.indice_depthwise_conv_tile), with the
     bias and the activation fused, and a stride 1 subm layer needs no
-    rulebook. Otherwise the forward and backward run on the rulebook.
+    rulebook. Otherwise the forward and backward run on the rulebook; on
+    CUDA, inference fuses the bias and the activation there too.
 
     Weight layout:
         `weight` is (C, *kernel_size, 1). This is spconv's KRSC layout
@@ -312,19 +313,26 @@ class SparseDepthwiseConvolution(SparseModule):
         # a stride 1 subm rulebook is symmetric, so its bwd pairs are its
         # fwd pairs; the others need pair_bwd for the input gradient
         is_subm = self.subm and not self.strided_subm
-        if features.is_cuda:
-            pair_bwd = None
-            if (not is_subm and features.requires_grad
-                    and torch.is_grad_enabled()):
-                pair_bwd = self._get_pair_bwd(datas, pair_fwd,
-                                              features.shape[0])
-            output_features = Fsp.indice_depthwise_conv(
-                features, self.weight, self.bias, pair_fwd, pair_bwd,
-                pair_fwd.shape[1], is_subm)
+        if features.is_cuda and not needs_grad:
+            # no autograd: the bias and the activation in the kernel
+            filters = self.weight.reshape(self.channels, -1).t()
+            output_features = ops.indice_depthwise_conv(
+                features, filters, self.bias, pair_fwd, pair_fwd.shape[1],
+                self.act_type, self.act_alpha)
         else:
-            output_features = self._forward_torch(features, pair_fwd,
-                                                  is_subm)
-        output_features = self._apply_act(output_features)
+            if features.is_cuda:
+                pair_bwd = None
+                if (not is_subm and features.requires_grad
+                        and torch.is_grad_enabled()):
+                    pair_bwd = self._get_pair_bwd(datas, pair_fwd,
+                                                  features.shape[0])
+                output_features = Fsp.indice_depthwise_conv(
+                    features, self.weight, self.bias, pair_fwd, pair_bwd,
+                    pair_fwd.shape[1], is_subm)
+            else:
+                output_features = self._forward_torch(features, pair_fwd,
+                                                      is_subm)
+            output_features = self._apply_act(output_features)
         return self._output_tensor(input, output_features, datas.out_indices,
                                    datas.out_spatial_shape, indice_dict)
 

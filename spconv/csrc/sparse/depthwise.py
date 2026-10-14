@@ -17,6 +17,19 @@ from cumm.common import GemmDTypes, TensorViewNVRTC
 
 _DTYPE_SIZES = {"float": 4, "tv::half_t": 2}
 
+# activations fused into the forward kernels, on the fp32 sum `a`: the cumm
+# Activation ones (none, relu, sigmoid, leaky_relu), and silu
+# (x * sigmoid(x)). The fast exp and division err by a few float ulps, far
+# below a float16 output's rounding; for large -a, exp(-a) is inf and both go
+# to 0, as they should.
+_ACTIVATIONS = {
+    "none": "",
+    "relu": "a = a > 0.0f ? a : 0.0f;",
+    "sigmoid": "a = __fdividef(1.0f, 1.0f + __expf(-a));",
+    "leaky_relu": "a = a >= 0.0f ? a : a * act_alpha;",
+    "silu": "a = __fdividef(a, 1.0f + __expf(-a));",
+}
+
 
 class SparseDepthwiseConvKernel(pccm.Class):
     """CUDA kernels of the depthwise sparse convolutions.
@@ -29,17 +42,19 @@ class SparseDepthwiseConvKernel(pccm.Class):
 
     These are compiled at runtime with NVRTC (spconv.pytorch.ops), as the
     nvrtc gemm kernels in spconv.algo, so they run with a prebuilt spconv.
-    NVRTC compiles non-template kernels only: an instance is one dtype and
-    one vector length (1, or 16 bytes for 128-bit loads). A kernel takes its
-    arguments in one array, pointers included, as a gemm kernel takes its
-    params struct, so a launch passes one argument.
+    NVRTC compiles non-template kernels only: an instance is one dtype, one
+    vector length (1, or 16 bytes for 128-bit loads) and one activation of
+    forward_kernel. A kernel takes its arguments in one array, pointers
+    included, as a gemm kernel takes its params struct, so a launch passes
+    one argument.
     """
 
-    def __init__(self, dtype: str, vec_len: int):
+    def __init__(self, dtype: str, vec_len: int, act_type: str = "none"):
         super().__init__()
         self.add_dependency(TensorViewNVRTC, GemmDTypes)
         self.dtype = dtype
         self.vec_len = vec_len
+        self.act = _ACTIVATIONS[act_type]
         # alignedarray: tv::array does not align to its third argument, and a
         # vector with the alignment of its element loads one element at a time
         self.vec_type = (f"tv::alignedarray<{dtype}, {vec_len}, "
@@ -47,16 +62,17 @@ class SparseDepthwiseConvKernel(pccm.Class):
 
     @pccm.cuda.cuda_global_function
     def forward_kernel(self):
-        """out[i, c] = bias[c] + sum_k filters[k, c] * in[pair[k, i], c].
+        """out[i, c] = act(bias[c] + sum_k filters[k, c] * in[pair[k, i], c]).
 
-        Also the input gradient, with the bwd pairs and no bias.
+        Also the input gradient, with the bwd pairs, no bias and no
+        activation.
         """
         code = pccm.FunctionCode()
         # 0 out_features, 1 in_features, 2 filters [RS, num_features], 3 bias
         # (read if has_bias), 4 indice_pairs [RS, num_indices], 5 has_bias,
         # 6 num_indices, 7 num_features, 8 RS, 9 num_blocks_x,
-        # 10 num_blocks_y, 11 one_dim
-        code.arg("args", "tv::array<int64_t, 12>")
+        # 10 num_blocks_y, 11 one_dim, 12 act_alpha as float bits
+        code.arg("args", "tv::array<int64_t, 13>")
 
         code.raw(f"""
         using T = {self.dtype};
@@ -70,6 +86,7 @@ class SparseDepthwiseConvKernel(pccm.Class):
         int num_features = int(args[7]), RS = int(args[8]);
         int num_blocks_x = int(args[9]), num_blocks_y = int(args[10]);
         int one_dim = int(args[11]);
+        float act_alpha = __int_as_float(int(args[12]));
         int block_idx_x = one_dim ? blockIdx.x % num_blocks_x : blockIdx.x;
         int block_idx_y = one_dim ? blockIdx.x / num_blocks_x : blockIdx.y;
         int num_vecs = num_features / {self.vec_len};
@@ -109,7 +126,9 @@ class SparseDepthwiseConvKernel(pccm.Class):
                 VecT res;
                 TV_PRAGMA_UNROLL
                 for (int v = 0; v < {self.vec_len}; ++v){{
-                    res[v] = {self.dtype}(acc[v]);
+                    float a = acc[v];
+                    {self.act}
+                    res[v] = {self.dtype}(a);
                 }}
                 out_vecs[int64_t(i) * num_vecs + j] = res;
             }}
@@ -184,19 +203,6 @@ class SparseDepthwiseConvKernel(pccm.Class):
         }}
         """)
         return code
-
-
-# fused activations of the tile kernel: the cumm Activation ones (none, relu,
-# sigmoid, leaky_relu), and silu (x * sigmoid(x)). The fast exp and division
-# err by a few float ulps, far below a float16 output's rounding; for large
-# -a, exp(-a) is inf and both go to 0, as they should.
-_ACTIVATIONS = {
-    "none": "",
-    "relu": "a = a > 0.0f ? a : 0.0f;",
-    "sigmoid": "a = __fdividef(1.0f, 1.0f + __expf(-a));",
-    "leaky_relu": "a = a >= 0.0f ? a : a * act_alpha;",
-    "silu": "a = __fdividef(a, 1.0f + __expf(-a));",
-}
 
 
 class SparseDepthwiseConvTileKernel(pccm.Class):
