@@ -12,16 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kernel size 1, which runs as a matrix multiply: a 1x1 conv must equal a
-linear map of each site's features, with the weight in its KRSC layout."""
+"""Bias and activation fused into spconv's convolutions (act_type), and kernel
+size 1, which runs as a matrix multiply.
+
+At inference a conv with act_type must equal the same conv without it followed
+by the PyTorch activation, for every conv type and algo. A 1x1 conv must equal
+a linear map of each site's features, with the weight in its KRSC layout.
+"""
 
 import pytest
 import torch
+from cumm import tensorview as tv
 from torch.nn import functional as F
 
 import spconv.pytorch as spconv
+from spconv.core import ConvAlgo
 
 DEVICE = torch.device("cuda")
+ALGOS = [ConvAlgo.Native, ConvAlgo.MaskImplicitGemm]
+ALPHA = 0.1
+ACTS = [(tv.gemm.Activation.ReLU, F.relu),
+        (tv.gemm.Activation.Sigmoid, torch.sigmoid),
+        (tv.gemm.Activation.LeakyReLU, lambda x: F.leaky_relu(x, ALPHA))]
+TOLERANCE = {torch.float32: 1e-4, torch.float16: 1e-2}
 
 
 def _random_tensor(ndim: int, channels: int, dtype=torch.float32,
@@ -32,6 +45,50 @@ def _random_tensor(ndim: int, channels: int, dtype=torch.float32,
     features = torch.randn(indices.shape[0], channels, device=device)
     return spconv.SparseConvTensor(features.to(dtype), indices, [size] * ndim,
                                    batch_size)
+
+
+def _conv_types(ndim: int, algo, dtype, in_channels: int,
+                out_channels: int):
+    """name -> (conv, run): one conv of each type, and the forward from the
+    test input to its output."""
+
+    def conv(*args, **kwargs):
+        return spconv.SparseConvolution(ndim, *args, algo=algo,
+                                        **kwargs).to(DEVICE, dtype).eval()
+
+    subm = conv(in_channels, out_channels, 3, padding=1, subm=True)
+    regular = conv(in_channels, out_channels, 3, 2, 1)
+    transposed = conv(in_channels, out_channels, 3, 2, 1, transposed=True)
+    down = conv(in_channels, in_channels, 3, 2, 1, indice_key="down")
+    inverse = conv(in_channels, out_channels, 3, indice_key="down",
+                   inverse=True)
+    return {
+        "subm": (subm, subm),
+        "regular": (regular, regular),
+        "transposed": (transposed, transposed),
+        "inverse": (inverse, lambda x: inverse(down(x))),
+    }
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("algo", ALGOS)
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_fused_act(ndim, algo, dtype):
+    """Native fuses the activation in its bias kernel, MaskImplicitGemm in the
+    gemm epilogue."""
+    torch.manual_seed(0)
+    x = _random_tensor(ndim, 16, dtype)
+    tolerance = TOLERANCE[dtype]
+    for name, (conv, run) in _conv_types(ndim, algo, dtype, 16, 24).items():
+        for act, act_fn in ACTS:
+            with torch.no_grad():
+                conv.act_type, conv.act_alpha = tv.gemm.Activation.None_, 0.0
+                expected = act_fn(run(x).features.float())
+                conv.act_type, conv.act_alpha = act, ALPHA
+                out = run(x).features.float()
+            torch.testing.assert_close(
+                out, expected, atol=tolerance, rtol=tolerance,
+                msg=lambda m: f"{name} {act}: {m}")
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
