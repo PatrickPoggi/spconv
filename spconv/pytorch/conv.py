@@ -54,6 +54,8 @@ def _apply_act(x: torch.Tensor, act_type: tv.gemm.Activation, act_alpha: float,
         return F.sigmoid(x)
     elif act_type == tv.gemm.Activation.LeakyReLU:
         return F.leaky_relu(x, act_alpha)
+    elif act_type == tv.gemm.Activation.SiLU:
+        return F.silu(x)
     else:
         raise NotImplementedError
 
@@ -148,8 +150,6 @@ class SparseConvolutionBase:
         self.act_beta = act_beta
         self.scale = 1.0
         self.zero_point = 0
-        if self.conv1x1:
-            assert act_type == tv.gemm.Activation.None_, "conv1x1 don't support fused act"
 
     def is_inverseable(self):
         return self.indice_key is not None and (not self.subm
@@ -231,17 +231,18 @@ class SparseConvolutionBase:
                 }
         if self.conv1x1 and not is_int8:
             # in int8 test mode, we don't implement conv1x1 via mm.
-            if FILTER_HWIO:
-                features = torch.mm(
-                    input.features,
-                    weight.view(self.out_channels, self.in_channels).T)
+            # the weight layout of __init__: only RSCK puts in before out
+            if (self.algo == ConvAlgo.Native and not ALL_WEIGHT_IS_KRSC
+                    and FILTER_HWIO):
+                weight_mat = weight.view(self.in_channels, self.out_channels)
             else:
-                features = torch.mm(
-                    input.features,
-                    weight.view(self.in_channels, self.out_channels))
-
+                weight_mat = weight.view(self.out_channels,
+                                         self.in_channels).T
             if bias is not None:
-                features += bias
+                features = torch.addmm(bias, input.features, weight_mat)
+            else:
+                features = torch.mm(input.features, weight_mat)
+            features = _apply_act(features, act_type, act_alpha, act_beta)
             out_tensor = out_tensor.replace_feature(features)
             # padding may change spatial shape of conv 1x1.
             out_tensor.spatial_shape = out_spatial_shape
@@ -348,7 +349,7 @@ class SparseConvolutionBase:
                         out_features = Fsp.indice_conv(
                             features, weight, indice_pairs_calc,
                             indice_pair_num, outids.shape[0], algo,
-                            input._timer, bias_for_infer, act_type, act_beta,
+                            input._timer, bias_for_infer, act_alpha, act_beta,
                             act_type)
             else:
                 datas = input.find_indice_pair(self.indice_key)

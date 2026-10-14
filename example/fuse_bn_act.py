@@ -80,6 +80,8 @@ def fuse_act_net(conv, act):
     elif isinstance(act, torch.nn.LeakyReLU):
         fused_conv.act_type = tv.gemm.Activation.LeakyReLU
         fused_conv.act_alpha = act.negative_slope
+    elif isinstance(act, torch.nn.SiLU):
+        fused_conv.act_type = tv.gemm.Activation.SiLU
     else:
         raise NotImplementedError
     return fused_conv
@@ -178,7 +180,7 @@ def fuse_act(model: torch.fx.GraphModule) -> torch.fx.GraphModule:
         # batch norm module, and then check `Node.args[0].target` to see if the
         # input `Node` is a convolution.
         # print(node.target, node.args, node.args[0].args)
-        if isinstance(modules[node.target], (torch.nn.ReLU, torch.nn.LeakyReLU, torch.nn.Sigmoid)):
+        if isinstance(modules[node.target], (torch.nn.ReLU, torch.nn.LeakyReLU, torch.nn.Sigmoid, torch.nn.SiLU)):
             if node.args[0].target in modules and isinstance(modules[node.args[0].target], SparseConvolution):
                 if len(node.args[0].users) > 1:  # Output of conv is used by other nodes
                     continue
