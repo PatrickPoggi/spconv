@@ -853,6 +853,8 @@ if __name__ == "__main__":
     test_inference_matches_rulebook_path()
     test_inference_reads_channel_views()
     test_inference_warns_without_tile_kernel()
+    test_rulebook_inference_fuses_act()
+    test_act_type_takes_cumm_activations()
     test_conv_attributes()
     test_inference_follows_weight_changes()
     test_kernels_reject_mismatched_dtypes()
