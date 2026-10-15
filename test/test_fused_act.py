@@ -42,7 +42,10 @@ def _random_tensor(ndim: int, channels: int, dtype=torch.float32,
                    device=DEVICE, size: int = 12, batch_size: int = 2,
                    density: float = 0.4) -> spconv.SparseConvTensor:
     shape = [batch_size] + [size] * ndim
-    indices = (torch.rand(shape, device=device) < density).nonzero().int()
+    # nonzero() is not contiguous on CUDA, and spconv reads indices as
+    # contiguous rows
+    mask = torch.rand(shape, device=device) < density
+    indices = mask.nonzero().int().contiguous()
     features = torch.randn(indices.shape[0], channels, device=device)
     return spconv.SparseConvTensor(features.to(dtype), indices, [size] * ndim,
                                    batch_size)
@@ -75,6 +78,17 @@ def _conv_types(ndim: int, algo, dtype, in_channels: int,
     }
 
 
+def _by_site(st: spconv.SparseConvTensor):
+    """(indices, features) with the rows sorted by site: a regular
+    MaskImplicitGemm rulebook orders its output sites by hash, differently in
+    each run."""
+    key = st.indices[:, 0].long()
+    for axis, size in enumerate(st.spatial_shape):
+        key = key * size + st.indices[:, axis + 1].long()
+    order = torch.argsort(key)
+    return st.indices[order], st.features[order]
+
+
 def _check_fused_act(ndim: int, algo, dtype):
     torch.manual_seed(0)
     x = _random_tensor(ndim, 16, dtype)
@@ -83,12 +97,13 @@ def _check_fused_act(ndim: int, algo, dtype):
         for act, act_fn in ACTS:
             with torch.no_grad():
                 conv.act_type, conv.act_alpha = tv.gemm.Activation.None_, 0.0
-                expected = act_fn(run(x).features.float())
+                indices, features = _by_site(run(x))
                 conv.act_type, conv.act_alpha = act, ALPHA
-                out = run(x).features.float()
+                out_indices, out = _by_site(run(x))
             case = f"{ndim}D {algo} {dtype} {name} {act}"
-            torch.testing.assert_close(out, expected, atol=tolerance,
-                                       rtol=tolerance,
+            assert torch.equal(out_indices, indices), case
+            torch.testing.assert_close(out.float(), act_fn(features.float()),
+                                       atol=tolerance, rtol=tolerance,
                                        msg=lambda m: f"{case}: {m}")
 
 
