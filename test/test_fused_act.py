@@ -20,13 +20,13 @@ by the PyTorch activation, for every conv type and algo. A 1x1 conv must equal
 a linear map of each site's features, with the weight in its KRSC layout.
 """
 
-import pytest
 import torch
 from cumm import tensorview as tv
 from torch.nn import functional as F
 
 import spconv.pytorch as spconv
 from spconv.core import ConvAlgo
+from spconv.pytorch.conv import SparseConvolution
 
 DEVICE = torch.device("cuda")
 ALGOS = [ConvAlgo.Native, ConvAlgo.MaskImplicitGemm]
@@ -54,8 +54,8 @@ def _conv_types(ndim: int, algo, dtype, in_channels: int,
     test input to its output."""
 
     def conv(*args, **kwargs):
-        return spconv.SparseConvolution(ndim, *args, algo=algo,
-                                        **kwargs).to(DEVICE, dtype).eval()
+        return SparseConvolution(ndim, *args, algo=algo,
+                                 **kwargs).to(DEVICE, dtype).eval()
 
     subm = conv(in_channels, out_channels, 3, padding=1, subm=True)
     regular = conv(in_channels, out_channels, 3, 2, 1)
@@ -75,12 +75,7 @@ def _conv_types(ndim: int, algo, dtype, in_channels: int,
     }
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-@pytest.mark.parametrize("algo", ALGOS)
-@pytest.mark.parametrize("ndim", [2, 3])
-def test_fused_act(ndim, algo, dtype):
-    """Native fuses the activation in its bias kernel, MaskImplicitGemm in the
-    gemm epilogue; a 1x1 conv applies it after the matrix multiply."""
+def _check_fused_act(ndim: int, algo, dtype):
     torch.manual_seed(0)
     x = _random_tensor(ndim, 16, dtype)
     tolerance = TOLERANCE[dtype]
@@ -91,22 +86,42 @@ def test_fused_act(ndim, algo, dtype):
                 expected = act_fn(run(x).features.float())
                 conv.act_type, conv.act_alpha = act, ALPHA
                 out = run(x).features.float()
-            torch.testing.assert_close(
-                out, expected, atol=tolerance, rtol=tolerance,
-                msg=lambda m: f"{name} {act}: {m}")
+            case = f"{ndim}D {algo} {dtype} {name} {act}"
+            torch.testing.assert_close(out, expected, atol=tolerance,
+                                       rtol=tolerance,
+                                       msg=lambda m: f"{case}: {m}")
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-@pytest.mark.parametrize("ndim", [2, 3])
-@pytest.mark.parametrize("subm", [True, False])
-def test_conv1x1_is_linear(subm, ndim, device):
-    """Different in and out channels, so a transposed weight cannot pass."""
+def test_fused_act():
+    """Native fuses the activation in its bias kernel, MaskImplicitGemm in the
+    gemm epilogue; a 1x1 conv applies it after the matrix multiply."""
+    for ndim in [2, 3]:
+        for algo in ALGOS:
+            for dtype in [torch.float32, torch.float16]:
+                _check_fused_act(ndim, algo, dtype)
+
+
+def _check_conv1x1(subm: bool, ndim: int, device):
     torch.manual_seed(0)
     x = _random_tensor(ndim, 16, device=device)
-    conv = spconv.SparseConvolution(ndim, 16, 24, 1, subm=subm).to(device)
+    conv = SparseConvolution(ndim, 16, 24, 1, subm=subm).to(device)
     with torch.no_grad():
         out = conv(x)
         # KRSC: (out, *kernel_size, in)
         expected = F.linear(x.features, conv.weight.reshape(24, 16), conv.bias)
     assert torch.equal(out.indices, x.indices)
     torch.testing.assert_close(out.features, expected)
+
+
+def test_conv1x1_is_linear():
+    """Different in and out channels, so a transposed weight cannot pass."""
+    for device in ["cpu", "cuda"]:
+        for ndim in [2, 3]:
+            for subm in [True, False]:
+                _check_conv1x1(subm, ndim, device)
+
+
+if __name__ == "__main__":
+    test_conv1x1_is_linear()
+    test_fused_act()
+    print("all ok")
