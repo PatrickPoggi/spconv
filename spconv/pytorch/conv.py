@@ -43,6 +43,10 @@ FILTER_HWIO = False
 
 _MAX_NUM_VOXELS_DURING_TRAINING = "max_num_voxels_during_training"
 
+# SparseConvolutionBase._implicit_gemm_reuse_forward; tests turn it off to
+# compare with the general path
+_FAST_IMPLICIT_GEMM_REUSE = True
+
 
 def _apply_act(x: torch.Tensor, act_type: tv.gemm.Activation, act_alpha: float,
                act_beta: float):
@@ -169,6 +173,12 @@ class SparseConvolutionBase:
                       act_alpha: float = 0,
                       act_beta: float = 0):
         # assert isinstance(input, SparseConvTensor)
+        if (_FAST_IMPLICIT_GEMM_REUSE and not training and add_input is None
+                and output_scale is None and channel_scale is None):
+            out_tensor = self._implicit_gemm_reuse_forward(
+                input, weight, bias, act_type, act_alpha, act_beta)
+            if out_tensor is not None:
+                return out_tensor
         is_int8 = input.is_quantized and weight.is_quantized
         if is_int8:
             assert output_scale is not None and channel_scale is not None, "int8 must be called in static quantized module"
@@ -524,6 +534,47 @@ class SparseConvolutionBase:
                 _apply_act(out_tensor.features + add_input.features,
                            self.act_type, self.act_alpha, self.act_beta))
 
+        return out_tensor
+
+    def _implicit_gemm_reuse_forward(
+            self, input: SparseConvTensor, weight: torch.Tensor,
+            bias: Optional[torch.Tensor], act_type: tv.gemm.Activation,
+            act_alpha: float,
+            act_beta: float) -> Optional[SparseConvTensor]:
+        """_conv_forward for the inference of a subm conv on float features
+        that reuses a stored implicit gemm rulebook, with less host work:
+        ops.implicit_gemm_reuse makes the same kernel call, so the output is
+        the same bit for bit, and the output tensor is built once. None for
+        any other call, which takes the general path."""
+        features = input.features
+        if (self.indice_key is None or not self.subm or self.inverse
+                or self.transposed or self.conv1x1
+                or self.algo == ConvAlgo.Native or input.benchmark
+                or input._timer.enable or not features.is_cuda
+                or features.dtype not in (torch.float16, torch.float32)
+                or not weight.is_contiguous() or not ops.SPCONV_CPP_GEMM
+                or ops.CONV_CPP is None):
+            return None
+        datas = input.indice_dict.get(self.indice_key)
+        if (not isinstance(datas, ImplicitGemmIndiceData)
+                or datas.algo != self.algo):
+            return None
+        assert features.shape[1] == self.in_channels, "channel size mismatch"
+        spatial_shape = input.spatial_shape
+        self._check_subm_reuse_valid(input, spatial_shape, datas)
+        if self.strided_subm:
+            out_spatial_shape = ops.get_conv_output_size(
+                spatial_shape, self.kernel_size, self.stride, self.padding,
+                self.dilation)
+        else:
+            out_spatial_shape = spatial_shape
+        out_features = ops.implicit_gemm_reuse(
+            features, weight, bias, datas, not self.strided_subm,
+            self.fp32_accum, act_alpha, act_beta, act_type, weight.dtype)
+        out_tensor = input.replace_feature(out_features)
+        out_tensor.indices = datas.out_indices
+        out_tensor.indice_dict = input.indice_dict.copy()
+        out_tensor.spatial_shape = out_spatial_shape
         return out_tensor
 
     def _check_subm_reuse_valid(self, inp: SparseConvTensor,

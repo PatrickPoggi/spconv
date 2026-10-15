@@ -13,6 +13,8 @@
 # limitations under the License.
 import functools
 import itertools
+import threading
+import weakref
 from enum import Enum
 from cumm import tensorview as tv
 from cumm.conv.bases import KRSC, NHWC, ConvOpType
@@ -23,7 +25,7 @@ import numpy as np
 import spconv
 from spconv.core import AlgoHint, ConvAlgo
 from typing import Dict, List, Optional, Tuple, Union
-from spconv.pytorch.core import ThrustSortAllocator
+from spconv.pytorch.core import ImplicitGemmIndiceData, ThrustSortAllocator
 from spconv.pytorch.cppcore import _TORCH_DTYPE_TO_TV, TorchAllocator, torch_tensor_to_tv, get_current_stream, get_arch, TorchSpconvMatmul
 from spconv.core_cc.csrc.sparse.all import SpconvOps
 from spconv.core_cc.csrc.sparse.alloc import ExternalAllocator
@@ -2741,3 +2743,105 @@ def indice_depthwise_conv_tile(features: torch.Tensor,
                    features.stride(0)
                ], _depthwise_stream(device_index))
     return out_features
+
+
+# conversions kept between implicit_gemm_reuse calls: per rulebook, per
+# weight and bias tensor (by identity, as tensors compare elementwise), and
+# one allocator per thread and device
+_IGEMM_RULEBOOK_TV: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+try:
+    from torch.utils.weak import WeakIdKeyDictionary
+    _IGEMM_PARAM_TV = WeakIdKeyDictionary()
+except ImportError:
+    _IGEMM_PARAM_TV = None
+_IGEMM_LOCAL = threading.local()
+_IGEMM_ARCHS: Dict[int, Tuple[int, int]] = {}
+# an empty tensor and a disabled timer, which implicit_gemm builds per call,
+# made on first use: C++ takes copies, so one of each serves every call
+_IGEMM_CONSTANTS: Dict[str, tuple] = {}
+
+
+def _igemm_rulebook_tv(datas: ImplicitGemmIndiceData):
+    """implicit_gemm's tensorview views of the forward rulebook, made once
+    per rulebook: the layers sharing it skip the conversions. The views stay
+    valid while the rulebook, which holds the tensors, is alive."""
+    views = _IGEMM_RULEBOOK_TV.get(datas)
+    if views is None:
+        views = (torch_tensor_to_tv(datas.pair_fwd), [
+            torch_tensor_to_tv(t, tv.uint32)
+            for t in datas.pair_mask_fwd_splits
+        ], [torch_tensor_to_tv(t) for t in datas.mask_argsort_fwd_splits],
+                 tv.from_numpy(np.concatenate(datas.masks)).clone())
+        _IGEMM_RULEBOOK_TV[datas] = views
+    return views
+
+
+def _igemm_param_tv(ten: torch.Tensor):
+    """A weight or bias as a tensorview view, kept while its memory, dtype
+    and shape are those it was made from: an in-place update keeps them, and
+    .to() or assigning .data changes them."""
+    if _IGEMM_PARAM_TV is None:
+        return torch_tensor_to_tv(ten)
+    key = (ten.data_ptr(), ten.dtype, ten.shape)
+    entry = _IGEMM_PARAM_TV.get(ten)
+    if entry is None or entry[0] != key:
+        entry = (key, torch_tensor_to_tv(ten))
+        _IGEMM_PARAM_TV[ten] = entry
+    return entry[1]
+
+
+def _igemm_allocator(device_index: int) -> TorchAllocator:
+    allocators = getattr(_IGEMM_LOCAL, "allocators", None)
+    if allocators is None:
+        allocators = _IGEMM_LOCAL.allocators = {}
+    alloc = allocators.get(device_index)
+    if alloc is None:
+        alloc = TorchAllocator(torch.device("cuda", device_index))
+        allocators[device_index] = alloc
+    return alloc
+
+
+def implicit_gemm_reuse(features: torch.Tensor, filters: torch.Tensor,
+                        bias: Optional[torch.Tensor],
+                        datas: ImplicitGemmIndiceData, is_subm: bool,
+                        fp32_accum: Optional[bool], act_alpha: float,
+                        act_beta: float, act_type: tv.gemm.Activation,
+                        output_dtype: torch.dtype) -> torch.Tensor:
+    """implicit_gemm for inference on float features with a stored rulebook:
+    the same ConvGemmOps.implicit_gemm call, so the same output bit for bit,
+    with less host work. The views of the rulebook and of the weights are
+    kept between calls, the allocator is reused, and the stream and the arch
+    are read without building Python objects."""
+    if not features.is_contiguous():
+        features = features.contiguous()
+    constant_args = _IGEMM_CONSTANTS.get("args")
+    if constant_args is None:
+        constant_args = (tv.Tensor(), tv.CUDAKernelTimer(False))
+        _IGEMM_CONSTANTS["args"] = constant_args
+    empty, timer = constant_args
+    pair_fwd_tv, pair_mask_tvs, mask_argsort_tvs, mask_tv = \
+        _igemm_rulebook_tv(datas)
+    # implicit_gemm takes the arch and the stream of the current device
+    device_index = torch.cuda.current_device()
+    arch = _IGEMM_ARCHS.get(device_index)
+    if arch is None:
+        arch = _IGEMM_ARCHS[device_index] = get_arch()
+    alloc = _igemm_allocator(features.get_device())
+    try:
+        ConvGemmOps.implicit_gemm(alloc, CONV_CPP,
+                                  torch_tensor_to_tv(features),
+                                  _igemm_param_tv(filters), pair_fwd_tv,
+                                  pair_mask_tvs, mask_argsort_tvs,
+                                  datas.out_indices.shape[0], mask_tv, arch,
+                                  False, is_subm,
+                                  _depthwise_stream(device_index),
+                                  timer,
+                                  fp32_accum is None, bool(fp32_accum),
+                                  empty if bias is None else
+                                  _igemm_param_tv(bias), act_alpha, act_beta,
+                                  act_type, constants.SPCONV_ALLOW_TF32, 1.0,
+                                  empty, empty, 0.0,
+                                  _TORCH_DTYPE_TO_TV[output_dtype])
+        return alloc.allocated[AllocKeys.OutFeatures]
+    finally:
+        alloc.allocated.clear()
