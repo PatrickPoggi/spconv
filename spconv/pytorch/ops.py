@@ -2745,6 +2745,111 @@ def indice_depthwise_conv_tile(features: torch.Tensor,
     return out_features
 
 
+def _get_grid_pairs_module(ksize: List[int], stride: List[int],
+                           padding: List[int], dilation: List[int],
+                           device_index: int):
+
+    def make_kernel():
+        from spconv.csrc.sparse.depthwise import GridPairsKernel
+        return GridPairsKernel(ksize, stride, padding, dilation)
+
+    key = ("grid_pairs", tuple(ksize), tuple(stride), tuple(padding),
+           tuple(dilation))
+    return _get_depthwise_nvrtc_module(key, make_kernel, device_index)
+
+
+def implicit_gemm_rulebook_from_grid(
+        indices: torch.Tensor,
+        grid: torch.Tensor,
+        ksize: List[int],
+        stride: List[int],
+        padding: List[int],
+        dilation: List[int],
+        out_indices: Optional[torch.Tensor] = None,
+        out_spatial_shape: Optional[List[int]] = None
+) -> ImplicitGemmIndiceData:
+    """The MaskImplicitGemm rulebook of a 2D submanifold conv for inference,
+    built from the index grid of its input without a host sync: one kernel
+    for the pairs and the tap masks, then the masks sorted as
+    get_indice_pairs_implicit_gemm sorts them. The rulebook is the one
+    spconv builds for the same output sites, in the order of out_indices.
+
+    indices: (N, 3) int32, the input sites; grid: depthwise_index_grid of
+    them. With stride 1 the output sites are the input sites (out_indices
+    None); with stride > 1 out_indices (M, 3) int32 lists the output sites in
+    any order, usually the parents p // stride of the input sites, which a
+    strided submanifold conv keeps. ksize, stride, padding and dilation are
+    the conv's.
+
+    Put the result in a SparseConvTensor's indice_dict under the indice_key
+    of the subm convs that use it: they then skip building a rulebook. It
+    has no backward pairs, as spconv's own subm rulebooks without gradients,
+    so it serves inference only.
+    """
+    ndim = 2
+    assert grid.dim() == ndim + 1 and grid.dtype == torch.int32 \
+        and grid.is_contiguous() and grid.is_cuda, \
+        "grid must be a contiguous int32 (batch, H, W) CUDA tensor"
+    if out_indices is None:
+        assert all(s == 1 for s in stride), "strided rulebooks need out_indices"
+        out_indices = indices
+    assert out_indices.dim() == 2 and out_indices.shape[1] == ndim + 1 \
+        and out_indices.dtype == torch.int32 and out_indices.is_contiguous()
+    assert out_indices.get_device() == grid.get_device()
+    if all(s == 1 for s in stride):
+        same = [(k // 2) * d for k, d in zip(ksize, dilation)]
+        if list(padding) != same:
+            raise ValueError(f"a stride 1 subm conv pads {same}, got {padding}")
+    kv = 1
+    for k in ksize:
+        kv *= k
+    assert kv <= 32, "the tap masks of one site must fit one uint32"
+    spatial_shape = list(grid.shape[1:])
+    if out_spatial_shape is None:
+        out_spatial_shape = spatial_shape
+        if any(s != 1 for s in stride):
+            out_spatial_shape = get_conv_output_size(spatial_shape, ksize,
+                                                     stride, padding, dilation)
+    num_out = out_indices.shape[0]
+    pair_fwd = torch.empty((kv, num_out), dtype=torch.int32,
+                           device=grid.device)
+    mask = torch.empty((num_out, ), dtype=torch.int32, device=grid.device)
+    if num_out > 0:
+        device_index = grid.get_device()
+        mod = _get_grid_pairs_module(list(ksize), list(stride), list(padding),
+                                     list(dilation), device_index)
+        mod.launch("grid_pairs_kernel", (div_up(num_out, 256), 1, 1),
+                   (256, 1, 1), 0, [
+                       pair_fwd.data_ptr(),
+                       mask.data_ptr(),
+                       grid.data_ptr(),
+                       out_indices.data_ptr(), num_out, spatial_shape[0],
+                       spatial_shape[1]
+                   ], _depthwise_stream(device_index))
+    # as SpconvOps.sort_1d_by_key_allocator: ascending unsigned masks, rows of
+    # equal masks in row order. A mask with bit 31 is negative as int32.
+    keys = mask if kv < 32 else mask.long() & 0xffffffff
+    sorted_mask, mask_argsort = torch.sort(keys, stable=True)
+    return ImplicitGemmIndiceData(
+        out_indices,
+        indices,
+        pair_fwd,
+        torch.Tensor(),
+        pair_mask_fwd_splits=[sorted_mask.to(torch.int32).view(num_out, 1)],
+        pair_mask_bwd_splits=[],
+        mask_argsort_fwd_splits=[mask_argsort.to(torch.int32)],
+        mask_argsort_bwd_splits=[],
+        masks=[np.array([0xffffffff], dtype=np.uint32)],
+        spatial_shape=spatial_shape,
+        out_spatial_shape=list(out_spatial_shape),
+        is_subm=True,
+        algo=ConvAlgo.MaskImplicitGemm,
+        ksize=list(ksize),
+        stride=list(stride),
+        dilation=list(dilation),
+        padding=list(padding))
+
+
 # conversions kept between implicit_gemm_reuse calls: per rulebook, per
 # weight and bias tensor (by identity, as tensors compare elementwise), and
 # one allocator per thread and device

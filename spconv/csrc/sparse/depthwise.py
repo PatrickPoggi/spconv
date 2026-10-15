@@ -484,3 +484,70 @@ class SparseDepthwiseConvTileKernel(pccm.Class):
         }}
         """)
         return code
+
+
+class GridPairsKernel(pccm.Class):
+    """The forward rulebook of a 2D conv at given output sites, read from the
+    index grid of its input (ops.depthwise_index_grid: the row of each active
+    site, -1 elsewhere), in the implicit gemm format SpconvOps builds:
+    pair[k, o] is the input row output o reads at kernel offset k (row-major
+    over the kernel), or -1, and bit k of mask[o] is set iff that row exists.
+
+    One thread per output and no hash table, so there is nothing to wait for
+    on the host. The kernel size, stride, padding and dilation are
+    compile-time constants: the loop over the taps unrolls.
+    """
+
+    def __init__(self, ksize, stride, padding, dilation):
+        super().__init__()
+        self.add_dependency(TensorViewNVRTC)
+        self.ksize = ksize
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+    @pccm.cuda.cuda_global_function
+    def grid_pairs_kernel(self):
+        code = pccm.FunctionCode()
+        # 0 pair_fwd [KH * KW, num_out], 1 mask [num_out] (uint32 bits),
+        # 2 in_grid [batch, in_h, in_w], 3 out_indices [num_out, 3] (batch, y,
+        # x), 4 num_out, 5 in_h, 6 in_w
+        code.arg("args", "tv::array<int64_t, 7>")
+        kh, kw = self.ksize
+        sh, sw = self.stride
+        ph, pw = self.padding
+        dh, dw = self.dilation
+        code.raw(f"""
+        int* pair_fwd = reinterpret_cast<int*>(args[0]);
+        uint32_t* mask = reinterpret_cast<uint32_t*>(args[1]);
+        const int* in_grid = reinterpret_cast<const int*>(args[2]);
+        const int* out_indices = reinterpret_cast<const int*>(args[3]);
+        int num_out = int(args[4]);
+        int in_h = int(args[5]), in_w = int(args[6]);
+        for (int o : tv::KernelLoopX<int>(num_out)) {{
+            const int* site = out_indices + int64_t(o) * 3;
+            const int* grid = in_grid + int64_t(site[0]) * in_h * in_w;
+            int oy = site[1] * {sh} - {ph};
+            int ox = site[2] * {sw} - {pw};
+            uint32_t bits = 0;
+            TV_PRAGMA_UNROLL
+            for (int ky = 0; ky < {kh}; ++ky){{
+                int iy = oy + ky * {dh};
+                bool inside = iy >= 0 && iy < in_h;
+                TV_PRAGMA_UNROLL
+                for (int kx = 0; kx < {kw}; ++kx){{
+                    int ix = ox + kx * {dw};
+                    int row = -1;
+                    if (inside && ix >= 0 && ix < in_w){{
+                        row = grid[int64_t(iy) * in_w + ix];
+                    }}
+                    pair_fwd[int64_t(ky * {kw} + kx) * num_out + o] = row;
+                    if (row >= 0){{
+                        bits |= 1u << (ky * {kw} + kx);
+                    }}
+                }}
+            }}
+            mask[o] = bits;
+        }}
+        """)
+        return code
