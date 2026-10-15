@@ -163,6 +163,10 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
             assert indices.dtype == torch.int32, "only support int32"
             assert batch_size > 0
             # assert features.shape[0] == indices.shape[0]
+            # the kernels read indices as contiguous rows, and nonzero() on
+            # CUDA, for one, returns them column-major
+            if not indices.is_contiguous():
+                indices = indices.contiguous()
         self._features = features
         self.indices = indices
         self.spatial_shape = [int(v) for v in spatial_shape]
